@@ -1,0 +1,14 @@
+create table t_ecmarginaccount
+(
+bankcode varchar(2) not null, -- 银行代码
+initialmargin number default 0 not null, -- 初始保证金金额
+balance number default 0 not null, -- 保证金账户余额
+lastupdtime varchar(14) -- 最后更新时间
+)
+action modename gzupay end
+action add end
+action update_by bankcode end
+action read_lock_by cur bankcode end
+action update_lock_by cur end
+action free_lock_by cur end
+end

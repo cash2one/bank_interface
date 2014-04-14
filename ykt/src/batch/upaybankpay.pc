@@ -1,0 +1,675 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <libgen.h>
+#include <string>
+#include <sstream>
+#include <iostream>
+#include <cassert>
+#include <errno.h>
+#include <iomanip>
+#include <stdexcept>
+#include <unistd.h>
+#include <vector>
+#include "errdef.h"
+#include "md5.h"
+#include "cpack.h"
+#include "bupub.h"
+#include "bufunc.h"
+#include "ConfigFile.h"
+#include "logger_imp.h"
+#include "acctrans.h"
+#include "yktclt.h"
+#include "dbfunc_foo.h"
+#include "ecbankfunc.h"
+
+using namespace std;
+EXEC SQL INCLUDE SQLCA;
+
+#define VERSION_STRING "1.0.0"
+#define BUILD_STRING "Build " __DATE__ " " __TIME__
+////////////////////////////////////////////////////////////////////////////////
+
+/**
+ * @class upay_bank_payment
+ * @author cheng.tang
+ * @date 2012-04-19
+ * @file upaybankpay.pc
+ * @brief - 电子现金流水发起支付交易
+ */
+class upay_bank_payment
+{
+public:
+    /**
+     * @brief - default constructor
+     */
+    upay_bank_payment();
+    /**
+     * @brief - default destructor
+     */
+    ~upay_bank_payment();
+    /**
+     * @brief - 运行主函数，入口函数
+     * @param argc - 命令行参数个数
+     * @param argv - 命令行参数
+     */
+    void run(int argc, char* const argv[]);
+private:
+    /**
+     * @class ecloaddtl
+     * @author cheng.tang
+     * @date 2012-04-19
+     * @file upaybankpay.pc
+     * @brief - ecloaddtl表对应字段映射
+     */
+    struct ecloaddtl
+    {
+        char accdate[9];
+        char refno[21];
+        int termid;
+        int cardno;
+        int custid;
+        int amount;
+        char cardphyid[17];
+        char crbankcode[3];
+        char crbankcardno[21];
+        int paystatus;
+        char payrefno[21];
+        char paymac[9];
+        int errcode;
+        char errmsg[256];
+    };
+    typedef std::vector<ecloaddtl> ECDTL_VECTOR;
+
+private:
+    int load_config();
+    int do_work();
+    void show_version();
+    void usage();
+    int process();
+    /**
+     * @brief - 获取待处理的电子现金圈存流水
+     * @param vec - 查询出的流水
+     * @param maxcount - 每次最多记录条数
+     * @return - 0 表示成功，其它失败
+     */
+    int fetch_dtl(ECDTL_VECTOR& vec, size_t maxcount = 1000);
+    /**
+     * @brief - 批量处理电子现金流水
+     * @param vec - 批量电子现金流水
+     * @return - 0 表示成功，其它失败
+     */
+    int batch_deal_dtl(ECDTL_VECTOR& vec);
+    /**
+     * @brief - 处理单条电子现金流水
+     * @param dtl - 电子现金流水
+     * @return - 0 表示成功 其它表示失败
+     */
+    int deal_one_dtl(ecloaddtl& dtl);
+
+    /**
+     * @brief - 向一卡通后台发起支付请求
+     * @param dtl - 待处理的流水
+     * @return - 0 表示成功，其它失败
+     */
+    int pay_process(ecloaddtl& dtl);
+
+    /**
+     * @brief - 获取支付代码
+     * @param dtl - 电子现金交易
+     * @param paycode - 输出，支付代码
+     * @return - 0 表示成功，其它失败
+     */
+    int get_paycode(ecloaddtl& dtl, int* paycode);
+
+    int load_paycode();
+
+private:
+
+    string config_file_;
+    string logger_conf_file_;
+    string exec_name_;
+    string exec_dir_;
+    string dburl_;
+    string ecard_svrip_;
+    int ecard_svrport_;
+    int ecard_basefunc_;
+    typedef std::map<std::string, int> transcode_map_type;
+    transcode_map_type transcode_;
+};
+////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////
+int main(int argc, char* const argv[])
+{
+    upay_bank_payment upay;
+    upay.run(argc, argv);
+    return 0;
+}
+////////////////////////////////////////////////////////////////////////////////
+
+upay_bank_payment::upay_bank_payment()
+{
+}
+upay_bank_payment::~upay_bank_payment()
+{
+    db_disconnect();
+}
+void upay_bank_payment::run(int argc, char* const argv[])
+{
+    exec_name_ = basename(argv[0]);
+    char temp[PATH_MAX];
+    memset(temp, 0, sizeof temp);
+    if (realpath(argv[0], temp) != NULL)
+    {
+        exec_dir_ = dirname(temp);
+    }
+    this->config_file_ = this->exec_name_;
+    this->config_file_ += ".conf";
+
+    int c = 0;
+    while (c != -1)
+    {
+        c = getopt(argc, argv, "f:l:hv");
+        switch (c)
+        {
+        case 'f':
+            config_file_ = optarg;
+            break;
+        case 'l':
+            logger_conf_file_ = optarg;
+            break;
+        case 'v':
+            show_version();
+            break;
+        case 'h':
+            usage();
+            break;
+        default:
+            break;
+        }
+    }
+    if (load_config())
+        return;
+
+    KS_YKT_Clt::Initialize(this->ecard_svrip_.c_str(), this->ecard_svrport_, this->ecard_basefunc_);
+    string xpack = this->exec_dir_;
+    xpack += "/cpack.dat";
+    KS_YKT_Clt::set_xpack_path(xpack.c_str());
+    do_work();
+}
+void upay_bank_payment::usage()
+{
+    std::cout << "Usage " << this->exec_name_ << " [-h|-v|[-f]]" << std::endl;
+    std::cout << "    -f config file path, default " << this->exec_name_ << ".conf" << std::endl;
+    //std::cout << "    -l logger config file path, default " << this->exec_name_ << ".logconf" << std::endl;
+    std::cout << "    -h Show this screen" << std::endl;
+    std::cout << "    -v show version info" << std::endl;
+    exit(0);
+}
+int upay_bank_payment::load_config()
+{
+    try
+    {
+        ConfigFile config(this->config_file_);
+        config.readInto(this->dburl_, "connectinfo");
+        config.readInto(this->ecard_svrip_, "ecard_svrip");
+        config.readInto(this->ecard_svrport_, "ecard_svrport");
+        config.readInto(this->ecard_basefunc_, "ecard_basefunc");
+
+        config.readInto(this->logger_conf_file_, "logconf");
+    }
+    catch (ConfigFile::file_not_found& ex)
+    {
+        std::cout << "Load config file [" << ex.filename << "] Error!" << std::endl;
+        return -1;
+    }
+    catch (ConfigFile::key_not_found& ex)
+    {
+        std::cout << "Load config file key[" << ex.key << "Error!" << std::endl;
+        return -1;
+    }
+    // setup logger
+    if (!init_logger(this->logger_conf_file_))
+    {
+        std::cout << "Error setup logger !!" << std::endl;
+    }
+    LOG(INFO, "启动电子现金圈存自动支付程序");
+    return 0;
+}
+int upay_bank_payment::do_work()
+{
+    int ret;
+
+    while (1)
+    {
+        ret = CheckDbConnected();
+        if (ret != 1)
+        {
+            ret = ConnectDb(this->dburl_.c_str());
+            if (ret)
+            {
+                LOG(ERROR, "连接数据库失败");
+                return -1;
+            }
+            if (load_paycode())
+            {
+                LOG(ERROR, "无法加载支付配置表");
+                return -1;
+            }
+        }
+        ret = process();
+        if (!ret)
+        {
+            ret = db_commit();
+            if (ret)
+            {
+                LOG(ERROR, "提交事务失败");
+                return -1;
+            }
+        }
+        else
+        {
+            ret = db_rollback();
+            if (ret)
+            {
+                LOG(ERROR, "回滚事务失败");
+                return -1;
+            }
+        }
+        sleep(5); // 等待5s
+    }
+    return 0;
+}
+void upay_bank_payment::show_version()
+{
+    std::cout << "Prog: " << this->exec_name_ << " Copyright all reserved supwisdom 2012 " << std::endl;
+    std::cout << "Version : " << VERSION_STRING << " " BUILD_STRING << std::endl;
+    exit(0);
+}
+int upay_bank_payment::process()
+{
+    ECDTL_VECTOR ecdtls;
+    int ret;
+    CAccTrans& ats = CAccTrans::GetInst();
+    ret = ats.Reset();
+    if (ret)
+    {
+        LOG(ERROR, "ats.Reset error,ret=" << ret);
+        return -1;
+    }
+    ret = fetch_dtl(ecdtls);
+    if (ret)
+    {
+        LOG(ERROR, "获取电子现金流水错误");
+        return -1;
+    }
+    if (ecdtls.size() == 0)
+    {
+        sleep(1);
+        return 0;
+    }
+    ret = batch_deal_dtl(ecdtls);
+    if (ret)
+    {
+        LOG(ERROR, "批量处理电子现金流水失败");
+        return -1;
+    }
+    return 0;
+}
+int upay_bank_payment::batch_deal_dtl(ECDTL_VECTOR& vec)
+{
+    for (size_t i = 0; i < vec.size(); ++i)
+    {
+        int ret;
+        ret = deal_one_dtl(vec[i]);
+        if (ret)
+        {
+            LOG(ERROR, "处理第[" << (i + 1) << "]条流水失败");
+            db_rollback();
+            return -1;
+        }
+        else
+        {
+            ret = db_commit();
+            if (ret)
+            {
+                LOG(ERROR, "提交事务失败");
+                return -1;
+            }
+        }
+    }
+    LOG(DEBUG, "处理电子现金流水[" << vec.size() << "]条完成");
+    return 0;
+}
+
+int upay_bank_payment::deal_one_dtl(ecloaddtl& dtl)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char accdate[9];
+    char refno[21];
+    sqlint32 paystatus = 0;
+    sqlint32 status = 0;
+    char payrefno[21];
+    sqlint16 indr = 0;
+    EXEC SQL END DECLARE SECTION;
+
+    des2src(accdate, dtl.accdate);
+    des2src(refno, dtl.refno);
+    status = 0;
+    paystatus = EC_PAYSTATUS_INIT;
+
+    EXEC SQL select status
+into :status:indr
+from t_ecloaddtl where accdate=:accdate and refno=:refno
+                               and paystatus=:paystatus for update;
+
+if (SQLCODE)
+    {
+        CHECK_DB_ERR;
+        LOG(ERROR, "准备更新电子现金流水失败,ret=" << SQLCODE);
+        if (DB_NOTFOUND == SQLCODE)
+            return 0;
+        return -1;
+    }
+    if (status != TRANSTATUS_SUCC)
+    {
+        LOG(ERROR, "流水状态错误，accdate=" << accdate << ",refno="
+            << refno << ",status=" << status);
+        return -1;
+    }
+    int ret;
+    ret = pay_process(dtl);
+    if (ret)
+    {
+        return -1;
+    }
+    paystatus = dtl.paystatus;
+    des2src(payrefno, dtl.payrefno);
+EXEC SQL update t_ecloaddtl set paystatus=:paystatus,payrefno=:payrefno
+        where accdate=:accdate and refno=:refno;
+    if (SQLCODE)
+    {
+        CHECK_DB_ERR;
+        LOG(ERROR, "更新流水支付结果失败");
+        return -1;
+    }
+    return 0;
+}
+
+int upay_bank_payment::fetch_dtl(ECDTL_VECTOR& vec, size_t maxcount)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char accdate[9];
+    char refno[21];
+    sqlint32 termid;
+    sqlint32 cardno;
+    sqlint32 custid;
+    sqlint32 amount;
+    char cardphyid[17];
+    char crbankcode[3];
+    char crbankcardno[21];
+    sqlint32 paystatus;
+    sqlint32 status;
+    char payrefno[21];
+    char paymac[9];
+    sqlint16 indr = 0;
+    EXEC SQL END DECLARE SECTION;
+
+    CAccTrans& ats = CAccTrans::GetInst();
+    des2src(accdate, ats.trans.accdate);
+    paystatus = EC_PAYSTATUS_INIT; // 未处理
+    status = 3; // 状态
+
+
+    EXEC SQL DECLARE ecdtl_cur CURSOR FOR
+    select refno,termid,cardno,custid,cardphyid,crbankcode,crbankcardno,
+    amount,paymac,payrefno
+from t_ecloaddtl where accdate=:accdate and paystatus=:paystatus
+                               and status=:status order by refno;
+    if (SQLCODE)
+    {
+        CHECK_DB_ERR;
+        LOG(ERROR, "不能定义游标");
+        return -1;
+    }
+
+    EXEC SQL OPEN ecdtl_cur;
+    if (SQLCODE)
+    {
+        CHECK_DB_ERR;
+        LOG(ERROR, "不能打开游标");
+        return -1;
+    }
+    while (1)
+    {
+        memset(refno, 0, sizeof refno);
+        termid = 0;
+        cardno = 0;
+        custid = 0;
+        memset(cardphyid, 0, sizeof cardphyid);
+        memset(crbankcode, 0, sizeof crbankcode);
+        memset(crbankcardno, 0, sizeof crbankcardno);
+        memset(paymac, 0, sizeof paymac);
+        memset(payrefno, 0, sizeof payrefno);
+        amount = 0;
+
+        EXEC SQL FETCH ecdtl_cur INTO
+:refno:indr,:termid:indr,:cardno:indr,:custid:indr,:cardphyid:indr,
+:crbankcode:indr,:crbankcardno:indr,:amount:indr,:paymac:indr,
+:payrefno:indr;
+
+        if (SQLCODE)
+        {
+            int ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE ecdtl_cur;
+            if (DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+            {
+                LOG(ERROR, "读取游标失败,ret=" << ret);
+                return -1;
+            }
+        }
+
+        ecloaddtl dtl;
+        memset(&dtl, 0, sizeof dtl);
+        des2src(dtl.accdate, accdate);
+        des2src(dtl.refno, refno);
+        dtl.termid = termid;
+        dtl.cardno = cardno;
+        dtl.custid = custid;
+        des2src(dtl.cardphyid, cardphyid);
+        des2src(dtl.crbankcode, crbankcode);
+        des2src(dtl.crbankcardno, crbankcardno);
+        des2src(dtl.paymac, paymac);
+        des2src(dtl.payrefno, payrefno);
+        dtl.amount = amount;
+
+        vec.push_back(dtl);
+        if (vec.size() >= maxcount)
+        {
+            EXEC SQL CLOSE ecdtl_cur;
+            break;
+        }
+    }
+    LOG(DEBUG, "读取电子现金流水[" << vec.size() << "]条");
+    return 0;
+}
+int upay_bank_payment::pay_process(ecloaddtl& dtl)
+{
+    KS_YKT_Clt clt;
+    int paycode = 0;
+
+    if (strlen(dtl.payrefno) != 0)
+    {
+        LOG(DEBUG, "未成功交易重试入账refno[" << dtl.refno << "]pay["
+            << dtl.payrefno << "]");
+    }
+    else
+    {
+        if (get_paycode(dtl, &paycode))
+        {
+            LOG(ERROR, "无法错误交易支付代码,refno[" << dtl.refno << "]bankcode["
+                << dtl.crbankcode << "]");
+            // modify tc 2013-2-4
+            // 当不支持的交易，paystatus 改为 EC_PAYSTATUS_NOTSUPPORT
+            dtl.paystatus = EC_PAYSTATUS_NOTSUPPORT;
+            strcpy(dtl.errmsg, "不支持支付");
+            return 0;
+        }
+        clt.SetIntFieldByName("lbank_acc_type", 1);   // 标志，试入账
+        clt.SetIntFieldByName("lwithdraw_flag", dtl.termid);   // 终端号
+        clt.SetIntFieldByName("lcert_code", paycode);   // 支付代码
+        clt.SetStringFieldByName("snote", "电子现金圈存支付");
+        clt.SetIntFieldByName("lvol0", dtl.cardno);
+        clt.SetIntFieldByName("lvol6", 0);   // 卡交易次数
+        clt.SetStringFieldByName("stx_pwd", "");   // 不传卡密码，则系统不验证
+        clt.SetIntFieldByName("lvol7", dtl.amount);   // 校园卡卡余额
+        clt.SetIntFieldByName("lvol1", dtl.amount);   // 支付金额
+
+        LOG(DEBUG, "发送交易支付请求。。。(试入账)");
+        //
+        if (!clt.SendRequest(850005, 10000))
+        {
+            LOG(ERROR, "请求一卡通系统支付失败,msg=" << clt.GetReturnMsg());
+            return -1;
+        }
+        if (clt.GetReturnCode() != 0)
+        {
+            LOG(ERROR, "一卡通支付请求错误，retcode=" << clt.GetReturnCode() << ",msg=" << clt.GetReturnMsg());
+            dtl.errcode = clt.GetReturnCode();
+            des2src(dtl.errmsg, clt.GetReturnMsg());
+            dtl.paystatus = EC_PAYSTATUS_FAILED; // 支付失败
+            return 0;
+        }
+
+
+        clt.GetNextPackage();
+        dtl.paystatus = 0;
+        int refno = 0;
+        GET_PACK_STR(clt, "sphone3", dtl.payrefno);
+        GET_PACK_STR(clt, "saddr", dtl.paymac);
+        LOG(DEBUG, "支付交易refno[" << dtl.refno << "]payrefno[" << dtl.payrefno
+            << "]mac[" << dtl.paymac << "]");
+    }
+    // 正式入账
+    clt.ResetHandler();
+    clt.SetIntFieldByName("lbank_acc_type", 2);   // 标志，正式入账
+    clt.SetIntFieldByName("lwithdraw_flag", dtl.termid);   // 终端号
+    clt.SetStringFieldByName("sphone3", dtl.payrefno);   // 交易参考号
+    clt.SetStringFieldByName("saddr", dtl.paymac);   // MAC
+    clt.SetIntFieldByName("lvol6", 0);   //
+
+    LOG(DEBUG, "发送交易支付请求。。。(入账)");
+    //
+    if (!clt.SendRequest(850005, 10000))
+    {
+        LOG(ERROR, "请求一卡通系统支付失败,msg=" << clt.GetReturnMsg());
+        dtl.paystatus = 0; // 超时，等待下次重试
+        return 0;
+    }
+    if (clt.GetReturnCode() != 0)
+    {
+        LOG(ERROR, "一卡通支付请求错误，retcode=" << clt.GetReturnCode() << ",msg=" << clt.GetReturnMsg());
+        dtl.errcode = clt.GetReturnCode();
+        des2src(dtl.errmsg, clt.GetReturnMsg());
+        dtl.paystatus = EC_PAYSTATUS_FAILED; // 支付失败
+    }
+    else
+    {
+        dtl.paystatus = EC_PAYSTATUS_OK; // 支付成功
+    }
+    LOG(DEBUG, "支付成功！交易refno[" << dtl.refno << "]payrefno[" << dtl.payrefno
+        << "]mac[" << dtl.paymac << "]");
+    return 0;
+}
+int upay_bank_payment::get_paycode(ecloaddtl& dtl, int* paycode)
+{
+    // /*
+//     #define ICBC_CODE "00"  // 工商银行
+//     #define BOC_CODE "01"   // 中国银行
+//     #define BANKCOMM_CODE "02" // 交通银行
+//     #define CCB_CODE "03"      // 建设银行
+//     */
+//     struct bankcode_paycode_t
+//     {
+//         const char* bankcode;
+//         int paycode;
+//     } bp[] =
+//     {
+//         {"00", 7101}, // 工行
+//         {"01", 7102}, // 中行
+//         {"02", 7103}, // 交行
+//         {"03", 7104}, // 建行
+//         {"04", 7105}, // 中银通
+//     };
+//     for (size_t i = 0; i < sizeof(bp) / sizeof(bp[0]); ++i)
+//     {
+//         if (strcmp(bp[i].bankcode, dtl.crbankcode) == 0)
+//         {
+//             *paycode = bp[i].paycode;
+//             return 0;
+//         }
+//     }
+//     return -1;
+    if (transcode_.count(dtl.crbankcode) > 0)
+    {
+        *paycode = transcode_[dtl.crbankcode];
+        return 0;
+    }
+    return -1;
+}
+int upay_bank_payment::load_paycode()
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+    char bankcode[3]={0};
+    int transcode = 0;
+    sqlint16 indr = 0;
+    EXEC SQL END DECLARE SECTION;
+
+    EXEC SQL DECLARE ectranscode_cur CURSOR FOR
+    select bankcode, transcode from t_ecpaytranscode order by bankcode;
+    if (SQLCODE)
+    {
+        CHECK_DB_ERR;
+        LOG(ERROR, "不能定义游标");
+        return -1;
+    }
+
+    EXEC SQL OPEN ectranscode_cur;
+    if (SQLCODE)
+    {
+        CHECK_DB_ERR;
+        LOG(ERROR, "不能打开游标");
+        return -1;
+    }
+    while (1)
+    {
+        memset(bankcode, 0, sizeof bankcode);
+        transcode = 0;
+
+EXEC SQL FETCH ectranscode_cur INTO :bankcode:indr, :transcode:indr;
+        if (SQLCODE)
+        {
+            int ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE ectranscode_cur;
+            if (DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+            {
+                LOG(ERROR, "读取游标失败,ret=" << ret);
+                return -1;
+            }
+        }
+        transcode_[bankcode] = transcode;
+    }
+    return 0;
+}

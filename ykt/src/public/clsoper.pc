@@ -1,0 +1,218 @@
+#include "clsoper.h"
+#include "acctrans.h"
+#include "logger_imp.h"
+
+namespace ekingstar
+{
+  COper::COper()
+  {
+    bLock = false;
+    bLoad = false;
+    memset(&oper, 0, sizeof(oper));
+  }
+  COper::~COper()
+  {
+    if(bLock)
+      DB_t_operator_free_lock_by_c0();
+  }
+  int COper::setOffline()
+  {
+    char szSql[128];
+    sprintf(szSql, "update t_operator set loginflag=0 where operid=%d", oper.operid);
+    db_rollback();
+    int ret = DynamicStmtExecute(szSql);
+    if(ret)
+      return ret;
+    db_commit();
+    return 0;
+  }
+  int  COper::loadOper(bool update)
+  {
+    int ret = 0;
+    memset(&oper, 0, sizeof(oper));
+		CAccTrans& ats=CAccTrans::GetInst();
+    if(update)
+    {
+      ret = DB_t_operator_read_lock_by_c0_and_opercode(ats.trans.opercode, &oper);
+    }
+    else
+      ret = DB_t_operator_read_by_opercode(ats.trans.opercode, &oper);
+    if(ret)
+    {
+      if(DB_NOTFOUND == ret)
+      {
+        return E_NOTEXIST_OPER;
+      }
+      else
+        return E_DB_OPERATOR_R;
+    }
+    bLock = update;
+    bLoad = true;
+		ats.trans.termid= oper.loginsiteno;
+		ats.trans.operid = oper.operid;
+    return 0;
+  }
+  T_t_operator& COper::getOper()
+  {
+    return oper;
+  }
+  int COper::getOperid()
+  {
+    return oper.operid;
+  }
+  int COper::check(bool unlimited)
+  {
+		CAccTrans& ats=CAccTrans::GetInst();
+    if(!bLoad)
+    {
+      ERRTIP("初始化错误:未调用loadOper方法");
+      return E_COMMON_ERR;
+    }
+    if(oper.status != 1)
+    {
+      return ERRINFO(E_OPER_LOGOUT, oper.opercode);
+    }
+    if(oper.opertype < 1)
+    {
+      if(!unlimited)
+        return E_SYSOPER_NORIGHT;
+    }
+    else
+    {
+      if(!oper.branchno)
+      {
+        ERRTIP("操作员%s没有网点号", oper.opercode);
+        return E_COMMON_ERR;
+      }
+    }
+    if(oper.loginflag != 1)
+    {
+      return ERRINFO(E_OPER_OFFLINE, oper.opercode);
+    }
+    if(oper.sitelimit)
+    {
+      if(oper.loginsiteno < 1)
+      {
+        setOffline();
+        return ERRINFO(E_OPER_OFFLINE, oper.opercode);
+      }
+    }
+    if(ats.trans.checknum)
+    {
+      if(oper.checknum != ats.trans.checknum)
+      {
+        //setOffline();
+        ERRTIP("当前操作员登录已失效,请重新登录系统");
+        return E_COMMON_ERR;
+      }
+    }
+    return 0;
+  }
+  int  COper::update()
+  {
+    bLock = false;
+    int ret = DB_t_operator_update_lock_by_c0(&oper);
+    if(ret)
+    {
+      return E_DB_OPERATOR_U;
+    }
+    return 0;
+  }
+  int  COper::saveOperdtl(int transstatus)
+  {
+    int ret = 0;
+		CAccTrans& ats=CAccTrans::GetInst();
+    T_t_operdtl tOperdtl;
+    memset(&tOperdtl, 0, sizeof(tOperdtl));
+
+    ret = GetNextOperdtlID(&tOperdtl.id);
+    if(ret)
+      return ret;
+    strcpy(tOperdtl.hostdate, CAccTrans::GetInst().trans.accdate);
+    strcpy(tOperdtl.hosttime, CAccTrans::GetInst().trans.acctime);
+    tOperdtl.operid = oper.operid;
+    tOperdtl.termid = oper.loginsiteno;
+    tOperdtl.operseqno = ats.trans.operseqno;
+    strcpy(tOperdtl.termdate, ats.trans.termdate);
+    strcpy(tOperdtl.termtime, ats.trans.termtime);
+    tOperdtl.transcode = ats.trans.transcode;
+    tOperdtl.status = transstatus;
+    des2src(tOperdtl.refno, ats.trans.refno);
+    strncpy(tOperdtl.transinfo, ats.trans.remark, 100);
+    ret = DB_t_operdtl_add(&tOperdtl);
+    if(ret)
+    {
+      if(DB_REPEAT == ret)
+        return E_DB_OPERDTL_E;
+      else
+        return E_DB_OPERDTL_I;
+    }
+    return 0;
+  }
+  int COper::findOrgiOperdtl()
+  {
+		CAccTrans& ats=CAccTrans::GetInst();
+    memset(&m_operdtl, 0, sizeof(m_operdtl));
+    int ret = DB_t_operdtl_read_by_operid_and_operseqno(oper.operid, ats.trans.operseqno, &m_operdtl);
+    if(ret)
+    {
+			if(DB_NOTFOUND==ret)
+				return E_DB_OPERDTL_N;
+			else
+				return E_DB_OPERDTL_R;
+    }
+		return 0;
+  }
+	T_t_operdtl& COper::getOperdtl()
+	{
+		return m_operdtl;
+	}
+  int COper::confirmOK()
+  {
+		CAccTrans& ats=CAccTrans::GetInst();
+    T_t_operdtl operdtl;
+    memset(&operdtl, 0, sizeof(operdtl));
+    int ret = DB_t_operdtl_read_by_operid_and_operseqno(oper.operid, ats.trans.operseqno, &operdtl);
+    if(ret)
+    {
+      return ret;
+    }
+    operdtl.status = TRANSTATUS_SUCC;
+    ret = DB_t_operdtl_update_lock_by_c0(&operdtl);
+    if(ret)
+      return E_DB_OPERDTL_U;
+    return 0;
+  }
+  int COper::confirmCancel()
+  {
+		CAccTrans& ats=CAccTrans::GetInst();
+    T_t_operdtl operdtl;
+    memset(&operdtl, 0, sizeof(operdtl));
+    int ret = DB_t_operdtl_read_by_operid_and_operseqno(oper.operid, ats.trans.operseqno, &operdtl);
+    if(ret)
+    {
+      return ret;
+    }
+    operdtl.status = TRANSTATUS_CANCEL;
+    ret = DB_t_operdtl_update_lock_by_c0(&operdtl);
+    if(ret)
+      return E_DB_OPERDTL_U;
+    return 0;
+  }
+  int COper::confirmFailed()
+  {
+		CAccTrans& ats=CAccTrans::GetInst();
+    T_t_operdtl operdtl;
+    memset(&operdtl, 0, sizeof(operdtl));
+    int ret = DB_t_operdtl_read_by_operid_and_operseqno(oper.operid, ats.trans.operseqno, &operdtl);
+    if(ret)
+    {
+      return ret;
+    }
+    operdtl.status = TRANSTATUS_FAIL;
+    ret = DB_t_operdtl_update_lock_by_c0(&operdtl);
+    if(ret)
+      return E_DB_OPERDTL_U;
+    return 0;
+  }
+}

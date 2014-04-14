@@ -1,0 +1,53 @@
+#include <stdio.h>
+#include <iostream>
+#include <fstream>
+#include "logger_imp.h"
+#include "config_imp.h"
+#include "unitfunc.h"
+#include "unitprocess.h"
+#include<iostream>
+#include<string>
+#include<sstream>
+using namespace std;
+
+int main(int argc, char* argv[])
+{
+	char szVersion[64];
+  sprintf(szVersion, "ecardsvr %s (%s %s)", YKT_VERSION, __DATE__, __TIME__);
+  const char short_opts[] = "vs";
+  int option;
+  while((option = getopt(argc, argv, short_opts)) != -1)
+  {
+    switch(option)
+    {
+    case 'v':
+      cout << szVersion << endl;
+      return 0;
+    case 's':
+      break;
+    default:
+      cout << "invalid option" << endl;
+      return -1;
+    }
+  }
+  string conf = argv[0];
+  conf = conf + ".conf";
+  if(!init_config(conf))
+  {
+    cout << "init config faild" << endl;
+    return -1;
+  }
+  if(!init_logger(config_obj.log_conf))
+  {
+    cout << "server init log faild" << endl;
+    return -2;
+  }
+  LOG(INFO, "version:" << szVersion);
+  LOG(DEBUG, "init log OK");
+  UnitProcess Process;
+  LOG(DEBUG, "start service");
+  Process.run();
+  return 0;
+}
+// vim: ts=2 et ft=cpp
+

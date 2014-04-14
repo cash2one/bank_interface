@@ -1,0 +1,10 @@
+[base]
+host=192.168.1.200
+port=22
+user=yktupay
+password=kingstar
+path=/home/yktupay/ykt
+
+[execute]
+remote_encoding=gb18030
+make_command=cd /home/yktupay/ykt/src/upaybanksvr && make

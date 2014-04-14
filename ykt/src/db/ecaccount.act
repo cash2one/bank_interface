@@ -1,0 +1,25 @@
+create table t_ecaccount
+(
+custid integer not null,
+custname varchar(60),
+cardno integer not null,
+ecbankno varchar(20) not null,
+status number(1) default 1 not null , 
+ecbala number default 0 not null ,
+updbaladate varchar(8), 
+updbalatime varchar(6),
+consumeamt number default 0 not null , 
+consumeupddate varchar(8), 
+consumeupdtime varchar(6),
+loadtotalamt number default 0 not null ,
+consumetotalamt number default 0 not null , 
+bankcode varchar(2)
+)
+action modename gzupay end
+action add end
+action read_by custid ecbankno end
+action update_by custid ecbankno end
+action read_lock_by cur custid ecbankno end
+action update_lock_by cur end
+action free_lock_by cur end
+end

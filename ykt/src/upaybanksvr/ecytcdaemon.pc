@@ -1,0 +1,226 @@
+/**
+(c) Copyright 2013 Supwisdom Tech. All Rights Reserved.
+中银通对账服务进程，负责签到、心跳等业务
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <libgen.h>
+#include <string>
+#include <sstream>
+#include <iostream>
+#include <cassert>
+#include <errno.h>
+#include <iomanip>
+#include <stdexcept>
+#include <unistd.h>
+#include <vector>
+#include "errdef.h"
+#include "md5.h"
+#include "cpack.h"
+#include "bupub.h"
+#include "bufunc.h"
+#include "ConfigFile.h"
+#include "logger_imp.h"
+#include "acctrans.h"
+#include "dbfunc_foo.h"
+#include "ecbankfunc.h"
+
+
+using namespace std;
+EXEC SQL INCLUDE SQLCA;
+
+#define VERSION_STRING "1.0.0"
+#define BUILD_STRING "Build " __DATE__ " " __TIME__
+
+/////////////////////////////////////////////////////////////////////////////////////////
+class upay_yct_daemon
+{
+public:
+    upay_yct_daemon();
+    ~upay_yct_daemon();
+    int run(int argc, char const *argv[]);
+private:
+    std::string exec_name_;
+    std::string config_file_;
+    std::string exec_dir_;
+    std::string logger_config_file_;
+    std::string dburl_;
+    std::string organization_key_; // 机构主密钥
+    std::string organization_code_; // 机构代码
+    bool load_base_config_;
+
+    int load_config();
+    int do_work();
+    void show_version();
+    int process();
+    bool is_login();
+    bool load_base_config();
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////
+upay_yct_daemon::upay_yct_daemon():load_base_config_(false)
+{
+
+}
+upay_yct_daemon::~upay_yct_daemon()
+{
+
+}
+int upay_yct_daemon::run(int argc, char const *argv[])
+{
+    exec_name_ = basename(argv[0]);
+    char temp[PATH_MAX];
+    memset(temp, 0, sizeof temp);
+    if (realpath(argv[0], temp) != NULL)
+    {
+        exec_dir_ = dirname(temp);
+    }
+    this->config_file_ = this->exec_name_;
+    this->config_file_ += ".conf";
+
+    int c = 0;
+    while (c != -1)
+    {
+        c = getopt(argc, argv, "f:l:hv");
+        switch (c)
+        {
+        case 'f':
+            config_file_ = optarg;
+            break;
+        case 'l':
+            logger_config_file_ = optarg;
+            break;
+        case 'v':
+            show_version();
+            break;
+        case 'h':
+            usage();
+            break;
+        default:
+            break;
+        }
+    }
+    if (load_config())
+        return;
+    do_work();
+    return 0;
+}
+int upay_yct_daemon::load_config()
+{
+    try
+    {
+        ConfigFile config(this->config_file_);
+        config.readInto(this->dburl_, "connectinfo");
+        config.readInto(this->logger_config_file_, "logconf");
+    }
+    catch (ConfigFile::file_not_found& ex)
+    {
+        std::cout << "Load config file [" << ex.filename << "] Error!" << std::endl;
+        return -1;
+    }
+    catch (ConfigFile::key_not_found& ex)
+    {
+        std::cout << "Load config file key[" << ex.key << "Error!" << std::endl;
+        return -1;
+    }
+    // setup logger
+    if (!init_logger(this->logger_conf_file_))
+    {
+        std::cout << "Error setup logger !!" << std::endl;
+    }
+    LOG(INFO, "启动电子现金圈存中银通守护进程");
+    return 0;
+}
+
+int upay_yct_daemon::do_work()
+{
+    int ret;
+
+    while (1)
+    {
+        ret = CheckDbConnected();
+        if (ret != 1)
+        {
+            ret = ConnectDb(this->dburl_.c_str());
+            if (ret)
+            {
+                LOG(ERROR, "连接数据库失败");
+                return -1;
+            }
+        }
+        ret = process();
+        if (!ret)
+        {
+            ret = db_commit();
+            if (ret)
+            {
+                LOG(ERROR, "提交事务失败");
+                return -1;
+            }
+        }
+        else
+        {
+            ret = db_rollback();
+            if (ret)
+            {
+                LOG(ERROR, "回滚事务失败");
+                return -1;
+            }
+        }
+        sleep(5); // 等待5s
+    }
+    return 0;
+}
+
+void upay_yct_daemon::show_version()
+{
+    std::cout << "Version : " << VERSION_STRING << std::endl;
+}
+
+int upay_yct_daemon::process()
+{
+    if(!is_login())
+    {
+        // try login
+    }
+    // if not login , try login
+    //   login
+    // check line status
+    return 0;
+}
+
+bool upay_yct_daemon::is_login()
+{
+    int ret;
+    int login_flag = 0;
+    ret = get_ec_para(YTCEC_LOGIN_STATUS, login_flag);
+    if (ret)
+    {
+        LOG(ERROR, "不能获取到状态");
+        return false;
+    }
+    return (login_flag == 1) ? true : false;
+}
+
+bool upay_yct_daemon::load_base_config()
+{
+    if(load_base_config_)
+        return true;
+    int ret;
+    
+    ret = get_ec_para(YTCEC_ORANIZATION_CODE, organization_code_);
+    if(ret)
+    {
+        LOG(ERRROR, "不能加载中银通机构代码");
+        return false;
+    }
+    
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+int main(int argc, char const *argv[])
+{
+    upay_yct_daemon daemon = upay_yct_daemon;
+    daemon.run(argc, argv);
+    return 0;
+}

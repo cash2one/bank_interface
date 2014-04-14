@@ -1,0 +1,10 @@
+projectDirectory = "$CWD"
+encoding=gb18030
+windowTitle = "gzdxc_ec_svr: ${TM_FILENAME}"
+
+include = "{.tm_properties,.htaccess,.sshftp_config,*}"
+[ text ]
+softWrap         = true
+wrapColumn       = 90
+
+

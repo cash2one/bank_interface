@@ -1,0 +1,1683 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <sstream>
+#include <cassert>
+#include <errno.h>
+#include <iomanip>
+#include <stdexcept>
+#include <map>
+#include "errdef.h"
+#include "unitfunc.h"
+#include "upaybanksvr.h"
+#include "md5.h"
+#include "tcp.h"
+#include "tinyxml.h"
+#include "ecbankfunc.h"
+#include "cpack.h"
+#include "bupub.h"
+#include "bufunc.h"
+#include "ecbankytc.h"
+
+#ifndef IC_RESULT
+#define IC_RESULT 134
+#endif
+
+using namespace std;
+EXEC SQL INCLUDE SQLCA;
+
+extern CSvrLink* g_pSvrLink;  // 与业务调度中心的连接
+
+////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////
+// ec_bank_any_ytc : 任何银行 to  中银通
+EC_REGISTER_TRANS(BANK_ANY_CODE, YTC_CODE, ec_bank_any_ytc);
+
+ec_bank_any_ytc::ec_bank_any_ytc()
+{
+}
+ec_bank_any_ytc::~ec_bank_any_ytc()
+{
+}
+static void transfer_xml_2_tlv(TiXmlNode* icc_data, std::string& ytcdata)
+{
+    //TiXmlDocument doc;
+    //string icc_data_str=ytcdata;
+    stringstream ytcss;
+    //doc.Parse(icc_data_str.c_str());
+    //TiXmlElement* icc_data = doc.FirstChildElement();
+    TiXmlElement* field_elem = icc_data->FirstChildElement();
+    //LOG(DEBUG,"field_elem"<<field_elem->Value());
+    while(field_elem)
+    {
+        string str;
+        str.assign(field_elem->Value());
+        str = str.substr(4);
+        ytcss << setiosflags(ios::uppercase) << str;
+        if(field_elem->FirstChild())
+            str.assign(field_elem->FirstChild()->Value());
+        else
+            str.assign("");
+        //LOG(DEBUG,"ytcdata"<<ytcdata.c_str());
+        int str_len = str.length() % 2 ? str.length() / 2 + 1 : str.length() / 2;
+        if(str_len < 127)
+        {
+            //stringstream ss;
+            ytcss << hex << setiosflags(ios::uppercase) << setfill('0') << setw(2) << str_len;
+            //ytcdata+=ss.str();
+            ytcss << str;
+        }
+        else
+        {
+            //stringstream ss;
+            int len_tmp = str_len;
+            int str_len_len = 1;
+            while(len_tmp >= 256)
+            {
+                len_tmp /= 256;
+                str_len_len++;
+            }
+            ytcss << hex << setiosflags(ios::uppercase) << setfill('0') << setw(2) << str_len_len + 0x80
+                  << setiosflags(ios::uppercase) << setfill('0') << setw(str_len_len) << str_len;
+            //ytcdata+=ss.str();
+            ytcss << str;
+        }
+        LOG(DEBUG, "ytcdata" << ytcdata.c_str());
+        field_elem = field_elem->NextSiblingElement();
+        LOG(DEBUG, "test_flag");
+    }
+    ytcdata = ytcss.str();
+}
+
+int ec_bank_any_ytc::transfer(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para)
+{
+    // a. 发送转账请求给中银通
+    int ret;
+    ecloaddtl.usemargin = MARGIN_INIT;
+    LOG(DEBUG, "中银通电子现金圈存，等待向一卡通圈存系统请求...");
+    ret = send_to_anybank(ecloaddtl , para);
+    LOG(DEBUG, "send_to_anybank: success.");
+    if(ret)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        ERRTIP("下账失败");
+        return ret;
+    }
+    LOG(DEBUG, "中银通电子现金圈存，等待向中银通请求...");
+    //sprintf( ecloaddtl.drrefno, "%08d", 1 );
+    // b. 发送圈存请求给中银通
+
+    string body;
+    string body_rev;
+    int reverse_flag = 0;
+    //int ret;
+
+    LOG(DEBUG, "编制请求报文");
+    ret = pack_body(ecloaddtl, para, body);
+    if(ret)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        return r_error;
+    }
+    string resp;
+    //string resp_rev;
+    int retries = 1;
+    LOG(DEBUG, "发送请求报文");
+    ret = send_to_ytc(ecloaddtl, body, resp);
+    //ret=r_recv;//测试冲正报文
+    if(ret == r_recv)
+    {
+        ecloaddtl.usemargin = MARGIN_UNCONFIRMED;
+        reverse_flag = 1;
+        LOG(DEBUG, "编制冲正请求报文");
+        int write_card = 1;
+        body = "";
+        ret = pack_reverse_body(ecloaddtl, para, body, write_card);
+        if(ret != 0)
+            return r_error;
+        /*while (--retries >= 0)
+        {
+
+            ret = reverse_to_ytc(ecloaddtl, body, resp);
+
+            if (ret != r_ok)
+                sleep(5000);
+            else
+                break;
+
+        }*/
+        LOG(DEBUG, "发送冲正请求报文");
+        ret = reverse_to_ytc(ecloaddtl, body, resp);
+        if(ret != r_ok)
+        {
+            strcpy(ecloaddtl.errmsg, "接受银行信息失败,冲正未成功");
+            LOG(ERROR, "接受银行信息失败,冲正未成功");
+        }
+    }
+    if(ret != r_ok)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        return ret;
+    }
+    //解密
+    /*
+    */
+    TiXmlDocument doc;
+    doc.Parse(resp.c_str());
+    TiXmlElement* root = doc.FirstChildElement();
+    //LOG(DEBUG, "root_value_test");
+    //LOG(DEBUG, "root_value"<<root->Value());
+    if(!root)
+    {
+        if(ecloaddtl.usemargin == MARGIN_INIT)
+            ecloaddtl.usemargin = MARGIN_UNCONFIRMED;
+        strcpy(ecloaddtl.errmsg, "中银通返回数据解析错误");
+        LOG(ERROR, "中银通返回数据解析错误");
+        LOG(ERROR, "[" << resp << "]");
+        return r_error;
+    }
+    string value;
+    //TiXmlNode** return_code
+    TiXmlNode* Return_Field;
+    if(!ec_xml_get_xml_childnode(*root, "Return", &Return_Field))
+    {
+        if(ecloaddtl.usemargin == MARGIN_INIT)
+            ecloaddtl.usemargin = MARGIN_UNCONFIRMED;
+        strcpy(ecloaddtl.errmsg, "中银通异常返回，解析异常返回错误");
+        LOG(ERROR, "中银通异常返回，解析异常返回错误");
+        LOG(ERROR, "[" << resp << "]");
+        return r_error;
+    }
+    {
+        string return_message;
+        if(ec_xml_get_xml_value(*Return_Field, "Return_Message", return_message))
+        {
+            /*  if ((!ec_xml_get_xml_childnode(root,"RETURN",return_node)) ||
+                (!ec_xml_get_xml_value(return_node, "RETURN_CODE", return_code))||
+                (!ec_xml_get_xml_value(return_node, "RETURN_MESSAGE", return_message)))
+                {
+                    strcpy(ecloaddtl.errmsg, "中银通异常返回，解析异常返回错误");
+                    LOG(ERROR, "中银通异常返回，解析异常返回错误");
+                }
+                else
+                {*/
+            des2src(ecloaddtl.errmsg, return_message.c_str());
+            LOG(ERROR, return_message.c_str());
+            LOG(ERROR, "[" << resp << "]");
+            //}
+            if(ecloaddtl.usemargin == MARGIN_INIT)
+                ecloaddtl.usemargin = MARGIN_UNCONFIRMED;
+            return r_error;
+        }
+    }
+    //检验mac
+    /*string mac_info;
+    ec_xml_get_xml_value(*Return_Field, "MESG_AUTHN_CODE", mac_info)
+    ret=check_mac(mac_info,resp);
+    if (ret)
+        return ret;
+    */
+    //解析报文
+    LOG(DEBUG, "[" << resp << "]");
+    int retcode = 0;
+    {
+        string value;
+        if(!ec_xml_get_xml_value(*Return_Field, "RESP_CODE", value) || value.empty())
+        {
+            strcpy(ecloaddtl.errmsg, "中银通返回错误信息解析错误");
+            LOG(ERROR, "中银通返回错误信息解析错误");
+            LOG(ERROR, "[" << resp << "]");
+            if(ecloaddtl.usemargin == MARGIN_INIT)
+                ecloaddtl.usemargin = MARGIN_UNCONFIRMED;
+            return r_error;
+        }
+        istringstream is(value);
+        is >> retcode;
+    }
+    if(retcode != 0)
+    {
+        ecloaddtl.errcode = retcode;
+        string errmsg;
+        ec_xml_get_xml_value(*Return_Field, "RESP_INFO", errmsg);
+        LOG(DEBUG, "中银通返回错误，ret=" << retcode << ",msg=" << errmsg);
+        //errmsg = parse_ytc_errmsg(errmsg);
+        LOG(ERROR, "[" << resp << "]");
+        des2src(ecloaddtl.errmsg, errmsg.c_str());
+        if(ecloaddtl.usemargin == MARGIN_INIT)
+            ecloaddtl.usemargin = MARGIN_NOUSE;
+        return r_error;
+    }
+    if(reverse_flag == 1)
+    {
+        LOG(DEBUG, "冲正成功.");
+        strcpy(ecloaddtl.errmsg, "圈存失败,但是冲正成功");
+        return r_error;
+    }
+    string ytcdata;
+
+    /*TiXmlHandle root_handle(root);
+    TiXmlHandle element_handle = root_handle.Child("Return", 0);
+    TiXmlHandle text = element_handle.Child("ICC_DATA",0);
+    if (!text.ToText())
+    {
+        LOG(DEBUG, "55域解析错误:文档转换失败");
+        des2src(ecloaddtl.errmsg, "55域解析错误:文档转换失败");
+        LOG(ERROR, "[" << resp << "]");
+        //return r_error;
+    }*/
+    TiXmlNode* icc_data;
+    ec_xml_get_xml_childnode(*Return_Field, "ICC_DATA", &icc_data);
+    //ytcdata = text.ToText()->Value();
+    LOG(ERROR, "开始转换");
+    transfer_xml_2_tlv(icc_data, ytcdata);
+
+    LOG(DEBUG, "55域tlv：" << ytcdata.c_str());
+    LOG(DEBUG, "[" << resp << "]");
+    //ec_xml_get_xml_value(*Return_Field , "ICC_DATA", ytcdata);
+    des2src(ecloaddtl.field55, ytcdata.c_str());
+    if(ecloaddtl.usemargin == MARGIN_INIT)
+        ecloaddtl.usemargin = MARGIN_USED;//圈存成功
+    else
+        ecloaddtl.usemargin = MARGIN_NOUSE;//冲正成功
+    return r_ok;
+}
+
+
+int ec_bank_any_ytc::send_to_anybank(T_t_ecloaddtl& ecloaddtl,
+                                     const ec_bank_trans_param& para)
+{
+    // 发送请求到圈存前置机进行圈存交易
+    ST_CPACK rCPack, aCPack;
+    ST_PACK* rPack = &(rCPack.pack);
+    LOG(DEBUG, "in send_to_anybank.");
+
+    ResetNormalCPack(&rCPack, 0, 1);
+    rCPack.head.RequestType = 900077;
+    SetHeadCol(&rCPack, F_SCLOSE_EMP, F_SDATE0, F_STIME0, F_SORDER2, F_SCUST_AUTH,
+               F_SSTATION0,
+               F_SSERIAL0, F_SSERIAL1, F_LVOL1, F_SORDER0, F_SEMP_PWD, 0);
+    LOG(DEBUG, "in send_to_anybank.0");
+    des2src(rPack->sclose_emp, "240001");
+    des2src(rPack->sdate0, ecloaddtl.transdate);
+    des2src(rPack->stime0, ecloaddtl.transtime);
+    sprintf(rPack->sorder2, "%d", ecloaddtl.termid);
+    des2src(rPack->scust_auth, ecloaddtl.drbankcardno);
+    des2src(rPack->sserial1, "0");
+    sprintf(rPack->sserial0, "%d", ecloaddtl.cardno);
+    rPack->lvol1 = 1;
+    sprintf(rPack->sorder0, "%d", ecloaddtl.amount);   // % 10000000000);
+    LOG(DEBUG, "in send_to_anybank.0.25");
+    des2src(rPack->semp_pwd, para["cardpwd"].c_str());
+    LOG(DEBUG, "in send_to_anybank.0.5");
+    // 获取配置参数
+    int ret;
+    int ecard_branch, ecard_mainfunc;
+    ret = get_ec_para(ECARD_QC_SVR_BRANCH, ecard_branch);
+    LOG(DEBUG, "in send_to_anybank.1");
+    if(ret)
+    {
+        LOG(ERROR, "未配置一卡通圈存前置机节点号[" << ECARD_QC_SVR_BRANCH << "]");
+        return r_error;
+    }
+    ret = get_ec_para(ECARD_QC_SVR_MAINFUNC, ecard_mainfunc);
+    LOG(DEBUG, "in send_to_anybank.2");
+    if(ret)
+    {
+        LOG(ERROR, "未配置一卡通圈存前置机主功能号[" << ECARD_QC_SVR_MAINFUNC <<
+            "]");
+        return r_error;
+    }
+
+    ST_PACK ArrayPack;
+    memset(&ArrayPack, 0, sizeof ArrayPack);
+    // 超时 45s
+    LOG(DEBUG, "向一卡通圈存系统请求branch[" << ecard_branch
+        << "]basefunc[" << ecard_mainfunc << "]");
+    ret = ExtCall(0, ecard_branch, ecard_mainfunc, 0, 45, &rCPack, &aCPack, &ArrayPack);
+    // 重置 ParmBits
+    memset(&rCPack, 0, sizeof rCPack);
+    g_pSvrLink->SetCol(0, rCPack.head.ParmBits);
+
+    LOG(DEBUG, "in send_to_anybank.3");
+    if(ret < 0)
+    {
+        LOG(ERROR, "向一卡通圈存请求，ret=" << ret << ",retcode=" << aCPack.head.retCode
+            << ",msg=" << aCPack.pack.vsmess);
+        des2src(ecloaddtl.errmsg, aCPack.pack.vsmess);
+        if(-2 == ret)
+        {
+            LOG(DEBUG, "向一卡通圈存系统请求超时");
+            return r_recv; // 请求超时
+        }
+        else
+        {
+            LOG(DEBUG, "向一卡通圈存系统请求失败");
+            return r_send;
+        }
+    }
+    LOG(DEBUG, "in send_to_anybank.4");
+    if(aCPack.head.retCode !=  0)
+    {
+        LOG(ERROR, "向一卡通圈存系统请求错误，ret=" << aCPack.head.retCode
+            << ",msg=" << aCPack.pack.vsmess);
+        des2src(ecloaddtl.errmsg, aCPack.pack.vsmess);
+        return r_error;
+    }
+    LOG(DEBUG, "向一卡通圈存系统请求成功，serialno[" << aCPack.pack.lvol1);
+
+    sprintf(ecloaddtl.drrefno, "%d", aCPack.pack.lvol1);
+    return r_ok;
+}
+
+/*static char * trim_right_space(char * vspStr)
+{
+    char *ptr = vspStr + strlen(vspStr) -1;
+        if( strlen( vspStr ) == 0)
+            return vspStr;
+
+        while ( ptr > vspStr && (*ptr == ' '))
+        {
+            *ptr = 0 ;
+            ptr--;
+        }
+
+    return (vspStr);
+}*/
+
+/*static char* trim_left_zero(int amt,char* amt_str)
+{
+
+    stringstream ss;
+    ss << amt;
+    char * ptr=ss.str().c_str();
+    while ((strlen(ptr) > 1)&&(*ptr=='0'))
+        ptr++;
+    strcpy(amt_str,ptr);
+    return amt_str;
+}*/
+
+static void get_first_field(std::string& icc_data,
+                            std::string& tag_field_name,
+                            std::string& tag_field_value)
+{
+    //取tag名字
+    //LOG(DEBUG, "in get_first_field");
+    size_t offset = 0;
+    {
+        if(icc_data[1] == 'F')
+            offset = 4;
+        else
+            offset = 2;
+        tag_field_name = icc_data.substr(0, offset);
+        icc_data = icc_data.substr(offset);
+    }
+
+    //取tag域值长度
+    int field_len = 0;
+
+    {
+        //stringstream ss;
+
+        if((icc_data[0] < '8') && (icc_data[0] >= '0'))
+        {
+            sscanf(icc_data.substr(0, 2).c_str(), "%x", &field_len);
+            icc_data = icc_data.substr(2);
+        }
+        else
+        {
+            //char tmp;
+            int field_len_len;
+
+            sscanf(icc_data.substr(0, 2).c_str(), "%x", &field_len_len);
+            field_len_len -= 0x80;
+            sscanf(icc_data.substr(2, field_len_len * 2).c_str(), "%x", &field_len);
+            icc_data = icc_data.substr((field_len_len + 1) * 2);
+        }
+    }
+
+    //取tag域值
+    {
+        tag_field_value = icc_data.substr(0, field_len * 2);
+        icc_data = icc_data.substr(field_len * 2);
+    }
+    //LOG(DEBUG, "out get_first_field");
+}
+
+int ec_bank_any_ytc::pack_body(T_t_ecloaddtl& ecloaddtl,
+                               const ec_bank_trans_param& para,
+                               std::string& body)
+{
+    TiXmlDocument doc;
+    {
+        TiXmlElement root("ROOT");
+        doc.InsertEndChild(root);
+    }
+    char dt[15] = {0};
+    getsysdatetime(dt);
+    string now(dt);
+
+    LOG(DEBUG, "root");
+    int ret = 0;
+    TiXmlNode& root = *(doc.FirstChild());
+
+    //版本号
+    ec_add_xml_node_value(root, "VERSION", "010101");
+
+    //交易代码
+    ec_add_xml_node_value(root, "TRANS_TYPE", "120229");
+
+    //动作代码
+    ec_add_xml_node_value(root, "ACTION_TYPE", "1");
+
+    //登录类型
+    /*{
+        stringstream ss;
+        ss << login_type;
+        ec_add_xml_node_value(root, "LOGIN_TYPE", ss.str());
+
+    }*/
+    ec_add_xml_node_value(root, "LOGIN_TYPE", "1");
+
+    //交易渠道
+    //trim_right_space(trans_source);
+    ec_add_xml_node_value(root, "TRANS_SOURCE", "BP");
+
+    //登录机构代码
+    //trim_right_space(login_inst_code);
+    ec_add_xml_node_value(root, "LOGIN_INST_CODE", "10006");
+
+    //交易日期
+    {
+        string str;
+        LOG(DEBUG, ecloaddtl.transdate);
+        str.assign(ecloaddtl.transdate, 8);
+        ec_add_xml_node_value(root, "TXN_DATE", str);
+    }
+
+    //交易时间
+    {
+        string str;
+        LOG(DEBUG, ecloaddtl.transtime);
+        str.assign(ecloaddtl.transtime, 6);
+        ec_add_xml_node_value(root, "TXN_TIME", str);
+    }
+
+    //跟踪号/流水号
+    {
+        string str;
+        LOG(DEBUG, ecloaddtl.refno);
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(7);
+        str.append(1, '0');
+        ec_add_xml_node_value(root, "TRACE_NO", str);
+    }
+
+    //登录网点代码
+    {
+        string str;
+
+        ret = get_ec_para(YTCEC_LOGIN_MERCH, str);
+        if(ret)
+        {
+            LOG(ERROR, "中银通登录网点代码未配置");
+            return E_COMMON_ERR;
+        }
+        ec_add_xml_node_value(root, "LOGIN_MERCH_CODE", str);
+    }
+    //ec_add_xml_node_value(root,"LOGIN_MERCH_CODE", "J001");
+
+    //登录操作员代码
+    {
+        string str;
+
+        ret = get_ec_para(YTCEC_LOGIN_USER, str);
+        if(ret)
+        {
+            LOG(ERROR, "中银通登录操作员代码未配置");
+            return E_COMMON_ERR;
+        }
+        ec_add_xml_node_value(root, "LOGIN_USER_CODE", str);
+    }
+
+    //主账号
+    if(strlen(ecloaddtl.crbankcardno) > 19)
+        return r_error;
+
+    ec_add_xml_node_value(root, "PRIMARY_ACCT_NUM", ecloaddtl.crbankcardno);
+
+    //ec_add_xml_node_value(root,"PRIMARY_ACCT_NUM", primary_acct_num);
+
+    //交易金额
+    {
+        stringstream ss;
+        LOG(DEBUG, "交易金额" << ecloaddtl.amount);
+        ss << setw(12) << setfill('0') << ecloaddtl.amount;
+        ec_add_xml_node_value(root, "AMT_TRANS", ss.str());
+
+    }
+    LOG(DEBUG, "交易金额2");
+    //ec_add_xml_node_value(root,"AMT_TRANS", );
+
+    /*//清算日期
+    ec_add_xml_node_value(root,"DATE_SETTLMT", );*/
+
+    //检索参考号
+    //trim_right_space(retrivl_ref_num);
+    {
+        string str;
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(2);
+        //str.append(1,'0');
+        ec_add_xml_node_value(root, "RETRIVL_REF_NUM", str);
+    }
+    LOG(DEBUG, "检索参考号");
+    //ec_add_xml_node_value(root,"RETRIVL_REF_NUM", "121011130469" );
+
+    //受卡机终端标识码
+    //trim_right_space(card_accptr_termnl_id);
+    ec_add_xml_node_value(root, "CARD_ACCPTR_TERMNL_ID", "12345676");
+
+    //货币代码
+    //trim_right_space(curr_code);
+    ec_add_xml_node_value(root, "CURR_CODE", "156");
+
+    //IC卡数据域（对应银联标准中55域，下列都是其子域）
+
+    ec_add_xml_node_value(root, "ICC_DATA", "");
+    TiXmlNode* icc_data;
+
+    ec_xml_get_xml_childnode(root, "ICC_DATA", &icc_data);
+
+    //解析55域字段，存入map
+    //LOG(DEBUG, "55"<<ecloaddtl.field55);
+    map<std::string, std::string> tag_map;
+    string field55(ecloaddtl.field55);
+    LOG(DEBUG, "55" << field55);
+    string tag_field_name(""), tag_field_value("");
+
+    while(field55.length() > 0)
+    {
+        get_first_field(field55, tag_field_name, tag_field_value);
+        // LOG(DEBUG, "tag_field_name"<<tag_field_name<<"tag_field_value"<<tag_field_value);
+        tag_map[tag_field_name] = tag_field_value;
+
+    }
+    LOG(DEBUG, "55map.com");
+    //应用密文
+    ec_add_xml_node_value(*icc_data, "TAG_9F26", tag_map["9F26"]);
+
+    //应用信息数据
+    ec_add_xml_node_value(*icc_data, "TAG_9F27", tag_map["9F27"]);
+
+    //发卡行应用数据
+    ec_add_xml_node_value(*icc_data, "TAG_9F10", tag_map["9F10"]);
+
+    //不可预知数
+    ec_add_xml_node_value(*icc_data, "TAG_9F37", tag_map["9F37"]);
+
+    //应用交易计数器
+    ec_add_xml_node_value(*icc_data, "TAG_9F36", tag_map["9F36"]);
+
+    //终端验证结果
+    ec_add_xml_node_value(*icc_data, "TAG_95", tag_map["95"]);
+
+    //交易日期
+    ec_add_xml_node_value(*icc_data, "TAG_9A", tag_map["9A"]);
+
+    //交易类型
+    ec_add_xml_node_value(*icc_data, "TAG_9C", tag_map["9C"]);
+
+    //交易金额
+    ec_add_xml_node_value(*icc_data, "TAG_9F02", tag_map["9F02"]);
+
+    //交易货币代码
+    ec_add_xml_node_value(*icc_data, "TAG_5F2A", tag_map["5F2A"]);
+
+    //应用交互特征
+    ec_add_xml_node_value(*icc_data, "TAG_82", tag_map["82"]);
+
+    //终端国家代码
+    ec_add_xml_node_value(*icc_data, "TAG_9F1A", tag_map["9F1A"]);
+
+    //其它金额
+    ec_add_xml_node_value(*icc_data, "TAG_9F03", tag_map["9F03"]);
+
+    //终端性能
+    ec_add_xml_node_value(*icc_data, "TAG_9F33", tag_map["9F33"]);
+
+
+
+
+
+    /*//发卡行认证数据
+    ec_add_xml_node_value(root,"91", );
+
+    //发卡行脚本1
+    ec_add_xml_node_value(root,"71", );
+
+    //发卡行脚本2
+    ec_add_xml_node_value(root,"72", );
+
+    //补登账户余额
+    ec_add_xml_node_value(root,"SUB_ACCT_BAL", );
+
+    //补登账户交易金额
+    ec_add_xml_node_value(root,"SUB_ACCT_TXN_AMT", );
+
+    //圈存完成后脱机交易金额
+    ec_add_xml_node_value(root,"ACCT_BAL", );
+
+    //响应信息
+    ec_add_xml_node_value(root,"RESP_INFO", );*/
+
+    //报文鉴别码
+    //ec_add_xml_node_value(root,"MESG_AUTHN_CODE", mac);
+    //for test
+    calc_trans_mac(&root);
+
+    TiXmlPrinter printer;
+    doc.Accept(&printer);
+    char xml_header[100] = "<?xml version='1.0' encoding='GBK'?>\n";
+    body.append(xml_header);
+    body += printer.CStr();
+
+
+    return 0;
+
+}
+int ec_bank_any_ytc::pack_reverse_body(T_t_ecloaddtl& ecloaddtl,
+                                       const ec_bank_trans_param& para,
+                                       std::string& body,
+                                       int write_card)
+{
+    TiXmlDocument doc;
+    {
+        TiXmlElement root("ROOT");
+        doc.InsertEndChild(root);
+    }
+    char dt[15] = {0};
+    getsysdatetime(dt);
+    string now(dt);
+
+
+    int ret = 0;
+    TiXmlNode& root = *(doc.FirstChild());
+
+    //版本号
+    ec_add_xml_node_value(root, "VERSION", "010101");
+
+    //交易代码
+    ec_add_xml_node_value(root, "TRANS_TYPE", "120231");
+
+    //动作代码
+    ec_add_xml_node_value(root, "ACTION_TYPE", "1");
+
+    //登录类型
+    /*{
+        stringstream ss;
+        ss << login_type;
+        ec_add_xml_node_value(root, "LOGIN_TYPE", ss.str());
+
+    }*/
+    ec_add_xml_node_value(root, "LOGIN_TYPE", "1");
+
+    //交易渠道
+    //trim_right_space(trans_source);
+    ec_add_xml_node_value(root, "TRANS_SOURCE", "BP");
+
+    //登录机构代码
+    //trim_right_space(login_inst_code);
+    ec_add_xml_node_value(root, "LOGIN_INST_CODE", "10006");
+
+    //交易日期
+    ec_add_xml_node_value(root, "TXN_DATE", now.substr(0, 8));
+
+    //交易时间
+    ec_add_xml_node_value(root, "TXN_TIME", now.substr(8, 6));
+
+    //跟踪号/流水号
+    {
+        string str;
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(7);
+        str.append(1, '1');
+        ec_add_xml_node_value(root, "TRACE_NO", str);
+    }
+
+    //登录网点代码
+    {
+        string str;
+
+        ret = get_ec_para(YTCEC_LOGIN_MERCH, str);
+        if(ret)
+        {
+            LOG(ERROR, "中银通登录网点代码未配置");
+            return E_COMMON_ERR;
+        }
+        ec_add_xml_node_value(root, "LOGIN_MERCH_CODE", str);
+    }
+    //ec_add_xml_node_value(root,"LOGIN_MERCH_CODE", "J001");
+
+    //登录操作员代码
+    {
+        string str;
+
+        ret = get_ec_para(YTCEC_LOGIN_USER, str);
+        if(ret)
+        {
+            LOG(ERROR, "中银通登录操作员代码未配置");
+            return E_COMMON_ERR;
+        }
+        ec_add_xml_node_value(root, "LOGIN_USER_CODE", str);
+    }
+
+    //主账号
+    if(strlen(ecloaddtl.crbankcardno) > 19)
+        return r_error;
+
+    ec_add_xml_node_value(root, "PRIMARY_ACCT_NUM", ecloaddtl.crbankcardno);
+
+    //ec_add_xml_node_value(root,"PRIMARY_ACCT_NUM", primary_acct_num);
+
+    //交易金额
+    {
+        stringstream ss;
+        ss << setw(12) << setfill('0') << ecloaddtl.amount;
+        ec_add_xml_node_value(root, "AMT_TRANS", ss.str());
+
+    }
+    //ec_add_xml_node_value(root,"AMT_TRANS", );
+
+    /*//清算日期
+    ec_add_xml_node_value(root,"DATE_SETTLMT", );*/
+
+    //检索参考号
+    //trim_right_space(retrivl_ref_num);
+    {
+        string str;
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(2);
+        //str.append(1,'0');
+        ec_add_xml_node_value(root, "RETRIVL_REF_NUM", str);
+    }
+    //ec_add_xml_node_value(root,"RETRIVL_REF_NUM", "121011130469" );
+
+    //受卡机终端标识码
+    //trim_right_space(card_accptr_termnl_id);
+    ec_add_xml_node_value(root, "CARD_ACCPTR_TERMNL_ID", "12345676");
+
+    //货币代码
+    //trim_right_space(curr_code);
+    ec_add_xml_node_value(root, "CURR_CODE", "156");
+
+    //IC卡数据域（对应银联标准中55域，下列都是其子域）
+
+    ec_add_xml_node_value(root, "ICC_DATA", "");
+    TiXmlNode* icc_data;
+    ret = 0;
+
+    if(write_card == 2)
+    {
+        ec_xml_get_xml_childnode(root, "ICC_DATA", &icc_data);
+        string icc_data_tlv;
+        ret = get_ec_para(IC_RESULT, icc_data_tlv);
+        if(ret)
+        {
+            LOG(ERROR, "写卡返回信息读取错误!");
+            return r_error;
+        }
+
+        map<std::string, std::string> tag_map;
+
+        LOG(DEBUG, "55" << icc_data_tlv);
+        string tag_field_name(""), tag_field_value("");
+
+        while(icc_data_tlv.length() > 0)
+        {
+            get_first_field(icc_data_tlv, tag_field_name, tag_field_value);
+            // LOG(DEBUG, "tag_field_name"<<tag_field_name<<"tag_field_value"<<tag_field_value);
+            tag_map[tag_field_name] = tag_field_value;
+
+        }
+
+
+        //终端验证结果
+        ec_add_xml_node_value(*icc_data, "TAG_95", tag_map["95"]);
+
+        //发卡行应用数据
+        ec_add_xml_node_value(*icc_data, "TAG_9F10", tag_map["9F10"]);
+
+        //应用交易计数器
+        ec_add_xml_node_value(*icc_data, "TAG_9F36", tag_map["9F36"]);
+    }
+
+    //原始交易信息（以下为子域）
+
+    ec_add_xml_node_value(root, "ORIG_TXN_INFO", "");
+    TiXmlNode* orig_txn_info;
+
+    ec_xml_get_xml_childnode(root, "ORIG_TXN_INFO", &orig_txn_info);
+
+    //原交易代码
+    ec_add_xml_node_value(*orig_txn_info, "ORIG_TRANS_TYPE", "120229");
+
+    //原交易日期
+    {
+        string str;
+        str.assign(ecloaddtl.transdate, 8);
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TXN_DATE", str);
+    }
+
+    //原交易时间
+    {
+        string str;
+        str.assign(ecloaddtl.transtime, 6);
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TXN_TIME", str);
+    }
+
+    //原交易流水号
+    {
+        string str;
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(7);
+        str.append(1, '0');
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TRACE_NO", str);
+    }
+    //ec_add_xml_node_value(*orig_txn_info,"ORIG_TRACE_NO", );
+
+    //原交易金额
+    {
+        stringstream ss;
+        ss << setw(12) << setfill('0') << ecloaddtl.amount;
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TXN_AMT", ss.str());
+
+    }
+    //ec_add_xml_node_value(*orig_txn_info,"ORIG_TXN_AMT", );
+
+    //原交易登录网点代码
+    ec_add_xml_node_value(*orig_txn_info, "ORIG_MERCH_CODE", "J001");
+
+
+    //报文鉴别码
+    // ec_add_xml_node_value(root,"MESG_AUTHN_CODE", "ABCDE1");
+    calc_trans_mac(&root);
+
+    TiXmlPrinter printer;
+    doc.Accept(&printer);
+
+    char xml_header[100] = "<?xml version='1.0' encoding='GBK'?>\n";
+    body.append(xml_header);
+    body += printer.CStr();
+    return 0;
+}
+int ec_bank_any_ytc::pack_post_trans_body(T_t_ecloaddtl& ecloaddtl,
+                                          const ec_bank_trans_param& para, int write_card,  std::string& body)
+{
+    TiXmlDocument doc;
+    {
+        TiXmlElement root("ROOT");
+        doc.InsertEndChild(root);
+    }
+    char dt[15] = {0};
+    getsysdatetime(dt);
+    string now(dt);
+    int ret = 0;
+
+    TiXmlNode& root = *(doc.FirstChild());
+
+    //版本号
+    ec_add_xml_node_value(root, "VERSION", "010101");
+
+    //交易代码
+    ec_add_xml_node_value(root, "TRANS_TYPE", "120233");
+
+    //动作代码
+    ec_add_xml_node_value(root, "ACTION_TYPE", "1");
+
+    /*//响应代码
+    ec_add_xml_node_value(root,"RESP_CODE", );*/
+
+    //登录身份类型
+    ec_add_xml_node_value(root, "LOGIN_TYPE", "1");
+
+    //交易渠道
+    ec_add_xml_node_value(root, "TRANS_SOURCE", "BP");
+
+    //登录机构代码
+    ec_add_xml_node_value(root, "LOGIN_INST_CODE", "10006");
+
+    //交易日期
+    ec_add_xml_node_value(root, "TXN_DATE", now.substr(0, 8));
+
+    //交易时间
+    ec_add_xml_node_value(root, "TXN_TIME", now.substr(8, 6));
+
+    //跟踪号/流水号
+    {
+        string str;
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(7);
+        str.append(1, '1');
+        ec_add_xml_node_value(root, "TRACE_NO", str);
+    }
+
+
+    //登录网点代码
+    {
+        string str;
+
+        ret = get_ec_para(YTCEC_LOGIN_MERCH, str);
+        if(ret)
+        {
+            LOG(ERROR, "中银通登录网点代码未配置");
+            return E_COMMON_ERR;
+        }
+        ec_add_xml_node_value(root, "LOGIN_MERCH_CODE", str);
+    }
+    //ec_add_xml_node_value(root,"LOGIN_MERCH_CODE", "J001");
+
+    //登录操作员代码
+    {
+        string str;
+
+        ret = get_ec_para(YTCEC_LOGIN_USER, str);
+        if(ret)
+        {
+            LOG(ERROR, "中银通登录操作员代码未配置");
+            return E_COMMON_ERR;
+        }
+        ec_add_xml_node_value(root, "LOGIN_USER_CODE", str);
+    }
+
+    //主账号
+    if(strlen(ecloaddtl.crbankcardno) > 19)
+        return r_error;
+
+    ec_add_xml_node_value(root, "PRIMARY_ACCT_NUM", ecloaddtl.crbankcardno);
+
+    //交易金额
+    {
+        stringstream ss;
+        ss << setw(12) << setfill('0') << ecloaddtl.amount;
+        ec_add_xml_node_value(root, "AMT_TRANS", ss.str());
+
+    }
+
+    /*//清算日期
+    ec_add_xml_node_value(root,"date_settlmt", );*/
+
+    //检索参考号
+    {
+        string str;
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(2);
+        //str.append(1,'0');
+        ec_add_xml_node_value(root, "RETRIVL_REF_NUM", str);
+    }
+
+    //受卡机终端标识码
+    ec_add_xml_node_value(root, "CARD_ACCPTR_TERMNL_ID", "12345676");
+
+    //货币代码
+    ec_add_xml_node_value(root, "CURR_CODE", "156");
+
+    //IC卡数据域（对应银联标准中55域，下列都是其子域）
+    ec_add_xml_node_value(root, "ICC_DATA", "");
+    TiXmlNode* icc_data;
+
+    ec_xml_get_xml_childnode(root, "ICC_DATA", &icc_data);
+    string icc_data_tlv;
+    icc_data_tlv = para["ic_result"];
+
+    map<std::string, std::string> tag_map;
+
+    LOG(DEBUG, "55" << icc_data_tlv);
+    string tag_field_name(""), tag_field_value("");
+
+    while(icc_data_tlv.length() > 0)
+    {
+        get_first_field(icc_data_tlv, tag_field_name, tag_field_value);
+        LOG(DEBUG, "tag_field_name" << tag_field_name << "tag_field_value" << tag_field_value);
+        tag_map[tag_field_name] = tag_field_value;
+
+    }
+
+    //终端性能
+    ec_add_xml_node_value(*icc_data, "TAG_9F33", tag_map["9F33"]);
+
+    //终端验证结果
+    ec_add_xml_node_value(*icc_data, "TAG_95", tag_map["95"]);
+
+    //不可预知数
+    ec_add_xml_node_value(*icc_data, "TAG_9F37", tag_map["9F37"]);
+
+    //接口设备序列号
+    ec_add_xml_node_value(*icc_data, "TAG_9F1E", tag_map["9F1E"]);
+
+    //发卡行应用数据
+    ec_add_xml_node_value(*icc_data, "TAG_9F10", tag_map["9F10"]);
+
+    //应用密文
+    ec_add_xml_node_value(*icc_data, "TAG_9F26", tag_map["9F26"]);
+
+    //应用交易计数器
+    ec_add_xml_node_value(*icc_data, "TAG_9F36", tag_map["9F36"]);
+
+    //应用交互特征
+    ec_add_xml_node_value(*icc_data, "TAG_82", tag_map["82"]);
+
+    //发卡方脚本结果
+    if(write_card == wc_success)
+    {
+        ec_add_xml_node_value(*icc_data, "TAG_DF31", "20");
+    }
+    else
+    {
+        ec_add_xml_node_value(*icc_data, "TAG_DF31", "10");
+    }
+
+    //终端国家代码
+    ec_add_xml_node_value(*icc_data, "TAG_9F1A", tag_map["9F1A"]);
+
+    //交易日期
+    ec_add_xml_node_value(*icc_data, "TAG_9A", tag_map["9A"]);
+
+    //原始交易信息（以下为子域）
+    ec_add_xml_node_value(root, "ORIG_TXN_INFO", "");
+    TiXmlNode* orig_txn_info;
+
+    ec_xml_get_xml_childnode(root, "ORIG_TXN_INFO", &orig_txn_info);
+
+
+    //原交易代码
+    ec_add_xml_node_value(*orig_txn_info, "ORIG_TRANS_TYPE", "120229");
+
+    //原交易日期
+    {
+        string str;
+        str.assign(ecloaddtl.transdate, 8);
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TXN_DATE", str);
+    }
+
+    //原交易时间
+    {
+        string str;
+        str.assign(ecloaddtl.transtime, 6);
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TXN_TIME", str);
+    }
+
+    //原交易流水号
+    {
+        string str;
+        str.assign(ecloaddtl.refno, 14);
+        //str[6]='0';
+        //str[7]='0';
+        str = str.substr(7);
+        str.append(1, '0');
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TRACE_NO", str);
+    }
+
+    //原交易金额
+    {
+        stringstream ss;
+        ss << setw(12) << setfill('0') << ecloaddtl.amount;
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_TXN_AMT", ss.str());
+
+    }
+    //原交易登录网点代码
+    {
+        string str;
+
+        ret = get_ec_para(YTCEC_LOGIN_MERCH, str);
+        if(ret)
+        {
+            LOG(ERROR, "中银通登录网点代码未配置");
+            return E_COMMON_ERR;
+        }
+        ec_add_xml_node_value(*orig_txn_info, "ORIG_MERCH_CODE", str);
+    }
+    //ec_add_xml_node_value(*orig_txn_info, "ORIG_MERCH_CODE", "J001");
+
+    /*//响应信息
+    ec_add_xml_node_value(root,"RESP_INFO", );*/
+
+    //报文鉴别码
+    // ec_add_xml_node_value(root,"mesg_authn_code", "ADE1");
+    calc_trans_mac(&root);
+
+    TiXmlPrinter printer;
+    doc.Accept(&printer);
+
+    char xml_header[100] = "<?xml version='1.0' encoding='GBK'?>\n";
+    body.append(xml_header);
+    body += printer.CStr();
+    return 0;
+}
+int ec_bank_any_ytc::post_transfer(T_t_ecloaddtl& ecloaddtl,
+                                   const ec_bank_trans_param& para,
+                                   int write_card)
+{
+#if 0
+    return r_ok;
+#else
+    int ret;
+    std::string body;
+    string resp;
+    ret = pack_post_trans_body(ecloaddtl, para, write_card, body);
+    if(ret)
+    {
+        LOG(ERROR, "生成写卡确认数据包错误");
+        /*if(write_card==2)
+        {
+            ret=pack_reverse_body(ecloaddtl, para, body, write_card);
+            if(ret!=0)
+                return r_error;
+
+            ret=reverse_to_ytc(ecloaddtl, body, resp);
+            if(ret != r_ok)
+                LOG(ERROR, "冲正未成功");
+        }
+        else*/
+        return r_error;
+    }
+
+    int retry = 3;
+
+    do
+    {
+        ret = send_to_ytc(ecloaddtl, body, resp);
+        retry--;
+    }
+    while((ret == r_conn || ret == r_send) && (retry > 0));
+
+    if(ret == r_conn || ret == r_send)
+    {
+        LOG(ERROR, "发送写卡确认失败");
+        /*if(write_card==2)
+        {
+            ret=pack_reverse_body(ecloaddtl, para, body, write_card);
+            if(ret!=0)
+                return r_error;
+
+            ret=reverse_to_ytc(ecloaddtl, body, resp);
+            if(ret != r_ok)
+                LOG(ERROR, "冲正未成功");
+        }
+        else*/
+        return ret;
+    }
+    else if(ret)
+    {
+        LOG(ERROR, "接收写卡确认返回失败");
+        return ret;
+    }
+    TiXmlDocument doc;
+    doc.Parse(resp.c_str());
+    TiXmlElement* root = doc.FirstChildElement();
+    if(!root)
+    {
+        strcpy(ecloaddtl.errmsg, "中银通返回数据解析错误");
+        LOG(ERROR, "中银通返回数据解析错误");
+        LOG(ERROR, "[" << body << "]");
+        return r_error;
+    }
+    if(check_trans_mac(root))
+    {
+        LOG(ERROR, "中银通返回MAC验证失败");
+    }
+    string value;
+    //TiXmlNode** return_code
+    TiXmlNode* Return_Field;
+    if(!ec_xml_get_xml_childnode(*root, "Return", &Return_Field))
+    {
+        strcpy(ecloaddtl.errmsg, "中银通异常返回，解析异常返回错误");
+        LOG(ERROR, "中银通异常返回，解析异常返回错误");
+        LOG(ERROR, "[" << resp << "]");
+        return r_error;
+    }
+    {
+        string return_message;
+        if(ec_xml_get_xml_value(*Return_Field, "Return_Message", return_message))
+        {
+            /*  if ((!ec_xml_get_xml_childnode(root,"RETURN",return_node)) ||
+                (!ec_xml_get_xml_value(return_node, "RETURN_CODE", return_code))||
+                (!ec_xml_get_xml_value(return_node, "RETURN_MESSAGE", return_message)))
+                {
+                    strcpy(ecloaddtl.errmsg, "中银通异常返回，解析异常返回错误");
+                    LOG(ERROR, "中银通异常返回，解析异常返回错误");
+                }
+                else
+                {*/
+            des2src(ecloaddtl.errmsg, return_message.c_str());
+            LOG(ERROR, return_message.c_str());
+            LOG(ERROR, "[" << resp << "]");
+            //}
+            return r_error;
+        }
+    }
+    //检验mac
+    /*string mac_info;
+    ec_xml_get_xml_value(*Return_Field, "MESG_AUTHN_CODE", mac_info)
+    ret=check_mac(mac_info,resp);
+    if (ret)
+        return ret;
+    */
+    //解析报文
+    int retcode = 0;
+    {
+        string value;
+        if(!ec_xml_get_xml_value(*Return_Field, "RESP_CODE", value) || value.empty())
+        {
+            strcpy(ecloaddtl.errmsg, "中银通返回错误信息解析错误");
+            LOG(ERROR, "中银通返回错误信息解析错误");
+            LOG(ERROR, "[" << resp << "]");
+            return r_error;
+        }
+        istringstream is(value);
+        is >> retcode;
+    }
+    if(retcode != 0)
+    {
+        ecloaddtl.errcode = retcode;
+        string errmsg;
+        ec_xml_get_xml_value(*Return_Field, "RESP_INFO", errmsg);
+        LOG(DEBUG, "中银通返回错误，ret=" << retcode << ",msg=" << errmsg);
+        //errmsg = parse_ytc_errmsg(errmsg);
+        LOG(ERROR, "[" << resp << "]");
+        des2src(ecloaddtl.errmsg, errmsg.c_str());
+        return r_error;
+    }
+    LOG(DEBUG, "receive resp:\n[" << resp << "]\n");
+    return r_ok;
+#endif
+}
+
+int ec_bank_any_ytc::send_to_ytc(T_t_ecloaddtl& ecloaddtl, const std::string& req,
+                                 std::string& resp)
+{
+    int timeout = 0;
+    string ytc_ip;
+    int ytc_port;
+    int ret;
+
+    ret = get_ec_para(YTCEC_TIMEOUT, timeout);
+    if(ret)
+    {
+        LOG(ERROR, "中银通超时时限未配置");
+        return E_COMMON_ERR;
+    }
+
+    timeout *= 1000;
+
+    ret = get_ec_para(YTCEC_SVRIP, ytc_ip);
+    if(ret)
+    {
+        LOG(ERROR, "中银通前置机未配置");
+        return r_conn;
+    }
+    ret = get_ec_para(YTCEC_SVRPORT, ytc_port);
+    if(ret)
+    {
+        LOG(ERROR, "中银通前置机未配置");
+        return r_conn;
+    }
+    LOG(DEBUG, "中银通服务器[" << ytc_ip << ":" << ytc_port << "]");
+
+    CTcpSocket sock;
+    alarm(timeout / 1000);
+    if(!sock.ConnectTcp((char*)ytc_ip.c_str(), ytc_port))
+    {
+        alarm(0);
+        strcpy(ecloaddtl.errmsg, "连接中银通服务器失败");
+        LOG(ERROR, "connect to ytc error");
+        return r_conn;
+    }
+    alarm(0);
+
+    // 中银通报文
+    stringstream ss;
+    ss << setw(4) << setfill('0') <<  req.length() << req;
+
+    LOG(DEBUG, "中银通报文[" << ss.str() << "]");
+    if(sock.Send((char*)ss.str().c_str(), ss.str().length()) < (int)ss.str().length())
+    {
+        strcpy(ecloaddtl.errmsg, "发送数据到中银通服务器失败");
+        LOG(ERROR, "Send to ytc error");
+        return r_send;
+    }
+    // 包头
+    size_t body_len = 0;
+    {
+        char buffer[5] = {0};
+        if(sock.Recv(buffer, 4, timeout) <= 0)
+        {
+            strcpy(ecloaddtl.errmsg, "接收中银通返回数据头失败");
+            LOG(ERROR, ecloaddtl.errmsg);
+            return r_recv;
+        }
+        istringstream is(buffer);
+        is >> body_len;
+    }
+    // 包体
+    string body;
+    {
+        char* buffer = new char[body_len + 1];
+        memset(buffer, 0, body_len + 1);
+        if(sock.Recv(buffer, body_len, timeout) <= 0)
+        {
+            strcpy(ecloaddtl.errmsg, "接收中银通返回数据内容失败");
+            LOG(ERROR, ecloaddtl.errmsg);
+            delete [] buffer;
+            return r_recv;
+        }
+        body = buffer;
+        delete [] buffer;
+
+        resp = body;
+    }
+    return r_ok;
+}
+int ec_bank_any_ytc::reverse_to_ytc(T_t_ecloaddtl& ecloaddtl, const std::string& req,
+                                    std::string& resp)
+{
+    int ret;
+    LOG(DEBUG, "发起冲正");
+    ret = send_to_ytc(ecloaddtl, req, resp);
+    if(ret)
+        return r_error;
+    return r_ok;
+}
+/*std::string ec_bank_any_ytc::parse_ytc_errmsg(const std::string& errmsg)
+{
+    size_t offset = 0;
+    if (errmsg.substr(offset, 2) == "F0")
+    {
+        offset += 2;
+    }
+    size_t msglen = 0;
+    {
+        istringstream is(errmsg.substr(offset, 2));
+        is >> hex >> msglen;
+        msglen *= 2;
+        offset += 2;
+    }
+    msglen = min(msglen, errmsg.length() - offset);
+    string temp = errmsg.substr(offset, msglen);
+    unsigned char* buffer = new unsigned char[temp.length() / 2 + 1];
+    memset(buffer, 0, temp.length() / 2 + 1);
+    decode_hex(temp, buffer);
+    string result = (char*)buffer;
+    delete [] buffer;
+    return result;
+}*/
+static bool test_and_get_node_value(TiXmlNode& root, const std::string& node_name,
+                                    std::string& node_value)
+{
+    TiXmlNode* node = NULL;
+    ec_xml_get_xml_childnode(root, node_name, &node);
+    if(NULL == node)
+        return false;
+    TiXmlHandle handle(node);
+    TiXmlHandle text = handle.FirstChild();
+    if(!text.ToText())
+        node_value = "";
+    else
+        node_value = text.ToText()->Value();
+    return true;
+}
+
+std::string ec_bank_any_ytc::get_mac_data(TiXmlNode* root)
+{
+    std::vector<std::string> mac_fields_def;
+    mac_fields_def.push_back("TRANS_TYPE");
+    mac_fields_def.push_back("CARD_NO");
+    mac_fields_def.push_back("STARTCARD");
+    mac_fields_def.push_back("PRIMARY_ACCT_NUM");
+    mac_fields_def.push_back("AMT_TRANS");
+    mac_fields_def.push_back("TXN_DATE");
+    mac_fields_def.push_back("TXN_TIME");
+    mac_fields_def.push_back("LOGIN_INST_CODE");
+    mac_fields_def.push_back("LOGIN_MERCH_CODE");
+    mac_fields_def.push_back("RESP_CODE");
+    mac_fields_def.push_back("ORIG_TRANS_TYPE");
+    mac_fields_def.push_back("ORIG_TXN_DATE");
+    mac_fields_def.push_back("ORIG_TXN_TIME");
+    mac_fields_def.push_back("ORIG_TRACE_NO");
+    mac_fields_def.push_back("ORIG_TXN_AMT");
+    mac_fields_def.push_back("ORIG_MERCH_CODE");
+    mac_fields_def.push_back("SEC_CTRL_INFO1");
+    mac_fields_def.push_back("SEC_CTRL_INFO2");
+    mac_fields_def.push_back("NET_MGMT_CODE");
+    size_t index;
+    TiXmlHandle root_handle(root);
+    TiXmlNode* origin_node = NULL;
+    ec_xml_get_xml_childnode(*root, "ORIG_TXN_INFO", &origin_node);
+    TiXmlHandle origin_handle(origin_node);
+    std::stringstream ss;
+    bool first = true;
+    bool last_space = false;
+    for(index = 0; index < mac_fields_def.size(); ++index)
+    {
+        string node_name = mac_fields_def[index];
+        TiXmlHandle element(NULL);
+        if(node_name.find("ORIG_") == 0 && origin_node != NULL)
+        {
+            element = origin_handle.Child(node_name.c_str(), 0);
+        }
+        else if(node_name == "AMT_TRANS")
+        {
+            string balance;
+            if(test_and_get_node_value(*root, "CARDCOUNT", balance))
+            {
+                int cardcnt = 0;
+                {
+                    istringstream is(balance);
+                    is >> cardcnt;
+                }
+                int totalbal = 0;
+                if(test_and_get_node_value(*root, "PLEDGEFLG", balance))
+                {
+                    int add;
+                    {
+                        istringstream is(balance);
+                        is >> add;
+                    }
+                    if(add == 1)
+                    {
+                        if(test_and_get_node_value(*root, "PLEDGE", balance))
+                        {
+                            istringstream is(balance);
+                            int temp;
+                            is >> temp;
+                            totalbal += temp * cardcnt;
+                        }
+                    }
+                }
+                if(test_and_get_node_value(*root, "FEEFLG", balance))
+                {
+                    int add;
+                    {
+                        istringstream is(balance);
+                        is >> add;
+                    }
+                    if(add == 1)
+                    {
+                        if(test_and_get_node_value(*root, "FEE", balance))
+                        {
+                            istringstream is(balance);
+                            int temp;
+                            is >> temp;
+                            totalbal += temp * cardcnt;
+                        }
+                    }
+                }
+                if(test_and_get_node_value(*root, "TOTAL_OUT_FEE_AMT", balance))
+                {
+                    istringstream is(balance);
+                    int temp;
+                    is >> temp;
+                    totalbal += temp;
+                }
+                ss << setw(12) << setfill('0') << totalbal;
+                last_space = false;
+                continue;
+            }
+            else
+            {
+                element = root_handle.Child(node_name.c_str(), 0);
+            }
+        }
+        else
+        {
+            element = root_handle.Child(node_name.c_str(), 0);
+        }
+        if(!first)
+        {
+            if(!last_space)
+            {
+                ss << " ";
+            }
+        }
+        else
+            first = false;
+        if(element.ToNode() == NULL)
+        {
+            //            ss << " ";
+            last_space = true;
+            continue;
+        }
+        ss << escape_value(element);
+        last_space = false;
+    }
+    string result = ss.str();
+    size_t endpos = result.length();
+    if(endpos > 0)
+        --endpos;
+    if(result[endpos] == ' ')
+        --endpos;
+    return result.substr(0, endpos + 1);
+}
+int ec_bank_any_ytc::calc_trans_mac(TiXmlNode* root)
+{
+    string mac_data = encode_hex(get_mac_data(root));
+    string mac_key;
+    int ret;
+    ret = get_ec_para(YTCEC_MACKEY, mac_key);
+    if(ret)
+    {
+        LOG(ERROR, "未设置MAC key");
+        return -1;
+    }
+    string mac;
+    ec_x9_19_mac_hex(mac_key, mac_data, mac);
+    ec_add_xml_node_value(*root, "MESG_AUTHN_CODE", mac);
+    return 0;
+}
+std::string ec_bank_any_ytc::escape_value(TiXmlHandle& element)
+{
+    TiXmlHandle text = element.FirstChild();
+    if(!text.ToText())
+        return " ";
+    string node_value = text.ToText()->Value();
+    stringstream ss;
+    int i;
+
+    for(i = 0; i < node_value.size(); ++i)
+    {
+        if(node_value[i] != ' ')
+            break;
+    }
+    node_value = node_value.substr(i);
+    for(i = node_value.size() - 1; i >= 0; --i)
+    {
+        if(node_value[i] != ' ')
+            break;
+    }
+    node_value = node_value.substr(0, i + 1);
+    if(node_value.empty())
+        return " ";
+    bool add_space = false;
+    for(size_t i = 0; i < node_value.size(); ++i)
+    {
+        char c = node_value[i];
+        if(c == ' ')
+        {
+            add_space = true;
+        }
+        else
+        {
+            if(add_space)
+            {
+                ss << " ";
+                add_space = false;
+            }
+            if(c >= 'a' && c <= 'z')
+            {
+                ss << (char)toupper(c);
+            }
+            else
+            {
+                ss << c;
+            }
+        }
+    }
+    string result = ss.str();
+    // cout << "Node : " << node_value << " : " << result << endl;
+    return ss.str();
+}
+int ec_bank_any_ytc::check_trans_mac(TiXmlNode* root)
+{
+    string trans_mac;
+    if(!ec_xml_get_xml_value(*root, "MESG_AUTHN_CODE", trans_mac))
+        return 0;
+
+    string mac_data = encode_hex(get_mac_data(root));
+    string mac_key;
+    int ret;
+    ret = get_ec_para(YTCEC_MACKEY, mac_key);
+    if(ret)
+    {
+        LOG(ERROR, "未设置MAC key");
+        return -1;
+    }
+    string mac;
+    ec_x9_19_mac_hex(mac_key, mac_data, mac);
+    stringstream ss;
+    ss << uppercase << trans_mac;
+    if(ss.str() == mac)
+        return 0;
+    return -1;
+}
+/////////////////////////////////////////////////////////////////////////////////////////
+// ec_bank_cash_ytc : 现金 to  中银通
+EC_REGISTER_TRANS(CASH_CODE, YTC_CODE, ec_bank_cash_ytc);
+ec_bank_cash_ytc::ec_bank_cash_ytc()
+{
+
+}
+ec_bank_cash_ytc::~ec_bank_cash_ytc()
+{
+
+}
+int ec_bank_cash_ytc::send_to_anybank(T_t_ecloaddtl& ecloaddtl,
+                                      const ec_bank_trans_param& para)
+{
+    // just return 0
+    return 0;
+}

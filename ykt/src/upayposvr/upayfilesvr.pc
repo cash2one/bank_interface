@@ -1,0 +1,1327 @@
+/* ----------------------------------------------------------
+ * 创建日期：2012-3-9
+ * 程序作者：闻剑
+ * 版本信息：3.0.0.0
+ * 程序功能：银联ftp文件生成工具
+ * ----------------------------------------------------------*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <sys/stat.h>
+
+#include "errdef.h"
+#include "pubdef.h"
+#include "pubdb.h"
+#include "pubfunc.h"
+#include "dbfunc.h"
+#include "dbfunc_foo.h"
+#include "acctrans.h"
+#include "transfunc.h"
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <iomanip>
+#include "ConfigFile.h"
+#include "logger_imp.h"
+#include "ks_8583_reader.h"
+#include "unionpaypos.h"
+using namespace std;
+
+EXEC SQL INCLUDE SQLCA;
+typedef struct
+{
+    int id;
+    char data[2001];
+} ST_POSDATA;
+
+typedef vector<int> POSDATAVECT;
+typedef vector<T_t_upaytask> POSTASKVECT;
+typedef vector<string>  VMERCHVECT;
+typedef vector<T_t_upayfile> POSFILEVECT;
+
+struct config_imp
+{
+    string logconf;  //Log配置
+    string connectinfo;  //数据库连接串
+    int expiredays;
+    string expirefilepath;
+};
+struct config_imp config_obj;
+static int gTaskType = 0;
+static bool isValidDate(const string& dateStr)
+{
+    // 检查长度
+    if(dateStr.size() != 8)
+        return false;
+    // 检查所有字符是否均为数字
+    int idx = 0;
+    while(idx < 8 && isdigit(dateStr[idx])) ++idx;
+    if(idx < 8)
+        return false;
+    // 检查年份是否在[1900, 2099]
+    string tmp;
+    tmp = dateStr.substr(0, 4);
+    int year = atoi(tmp.c_str());   // to extract year
+    if(year < 1900 || 2099 < year)
+        return false;
+    // 检查月份和日期是否合乎逻辑
+    tmp = dateStr.substr(4, 2); // 抽取月份字符窜
+    int month = atoi(tmp.c_str());
+    tmp = dateStr.substr(6, 2);    // 抽取日期字符窜
+    int day = atoi(tmp.c_str());
+    switch(month)
+    {
+        case 1:
+        case 3:
+        case 5:
+        case 7:
+        case 8:
+        case 10:
+        case 12: /* 31天 */
+            return 0 < day && day < 32;
+        case 4:
+        case 6:
+        case 9:
+        case 11:                          /* 30天 */
+            return 0 < day && day < 31;
+        case 2:                  /* 2月份比较特殊，闰年: 29天，平年: 28天 */
+        {
+            int leap = (0 == year % 4 && 0 != year % 100) || (0 == year % 400);
+            return (1 == leap && (0 < day && day < 30)) || (0 == leap && (0 < day && day < 29));
+        }
+        default:
+            return false;
+    }
+}
+static bool isValidTime(const string& timeStr)
+{
+    if(timeStr.size() != 6)
+    {
+        return false;
+    }
+    string tmp;
+    tmp = timeStr.substr(0, 2);
+    int n = atoi(tmp.c_str());
+    if(n < 0 || n > 24)
+    {
+        return false;
+    }
+    tmp = timeStr.substr(2, 2);
+    n = atoi(tmp.c_str());
+    if(n < 0 || n > 59)
+    {
+        return false;
+    }
+    tmp = timeStr.substr(4, 2);
+    n = atoi(tmp.c_str());
+    if(n < 0 || n > 59)
+    {
+        return false ;
+    }
+    return true;
+}
+//! @brief 生成目录
+
+/*!
+
+以指定的权限创建目录.
+
+对于指定要创建的目录，如果其父目录不存在(递归至要生成的目标上报的根目录)，那么会创建其对应的父目录
+
+例如，指定要创建的目录: "/foo/bar"，如果/foo/目录不存在，那么在创建 bar 目录之前会创建 /foo 目录
+
+对于要生成的目标目录，"./foo/bar" 等价于 "foo/bar"
+
+@param szDirectoryPath 要创建的目录的路径
+
+@param iDirPermission 创建目录时，为所创建的目录所指定的权限
+
+@return 如果创建成功，返回<b>true</b>;如果创建失败，返回<b>false</b>.
+
+*/
+static bool CreateDirectory(const char *szDirectoryPath , int iDirPermission = 0755)
+{
+    if(NULL == szDirectoryPath)
+    {
+
+#ifdef DEBUG
+        fprintf(stderr , "[%s][%d][%s][parameter < szDirectoryPath > for < CreateDirectory > should not be NULL]\n" , \
+                __FILE__ , __LINE__ , __FUNCTION__);
+
+#endif
+        return false;
+
+    }
+    int iPathLength = static_cast< int >(strlen(szDirectoryPath));
+
+    if(iPathLength > PATH_MAX)
+    {
+
+#ifdef DEBUG
+
+        fprintf(stderr , "[%s][%d][%s][the path length(%d) exceeds system max path length(%d)]\n" , \
+                __FILE__ , __LINE__ , __FUNCTION__ , iPathLength , PATH_MAX);
+
+#endif
+        return false;
+
+    }
+    char szPathBuffer[ PATH_MAX ] = { 0 };
+    memcpy(szPathBuffer , szDirectoryPath , iPathLength);
+    //在末尾加/
+    if(szPathBuffer[iPathLength - 1] != '\\' && szPathBuffer[iPathLength - 1] != '/')
+    {
+        szPathBuffer[iPathLength] = '/';
+        szPathBuffer[iPathLength + 1] = '\0';
+        ++iPathLength;
+    }
+    for(int i = 0 ; i < iPathLength ; ++i)
+    {
+        char& refChar = szPathBuffer[ i ];
+        //目录分隔符
+        if(('/' == refChar) && (0 != i))
+        {
+            refChar = '\0';
+            //判断当前目录是否存在
+            int iStatus = access(szPathBuffer , F_OK);
+            if(0 != iStatus)
+            {
+                if((ENOTDIR == errno) || (ENOENT == errno))
+                {
+                    //以指定权限创建目录
+                    iStatus = mkdir(szPathBuffer , iDirPermission);
+                    if(0 != iStatus)
+                    {
+#ifdef DEBUG
+                        fprintf(stderr , "[%s][%d][%s][< mkdir > fail , ErrCode:%d , ErrMsg:%s]\n" , \
+                                __FILE__ , __LINE__ , __FUNCTION__ , errno , strerror(errno));
+#endif
+                        return false;
+                    }
+                }
+                else
+                {
+#ifdef DEBUG
+                    fprintf(stderr , "[%s][%d][%s][< access > fail , RetCode: %d , ErrCode:%d , ErrMsg:%s]\n" , \
+                            __FILE__ , __LINE__ , __FUNCTION__ , iStatus , errno , strerror(errno));
+#endif
+                    return false;
+                }
+            }
+            refChar = '/';
+        }
+    }
+    return true;
+}
+
+static int QueryVirtualMerchno(const char* orgi_merchno, char* virtual_merchno)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_orgi_merchno[16] = {0};
+        char ho_virtual_merchno[16] = {0};
+    EXEC SQL END DECLARE SECTION;
+    SQLCODE = 0;
+    des2src(hi_orgi_merchno, orgi_merchno);
+    EXEC SQL
+     select vmerchno into
+     :ho_virtual_merchno
+     from t_merchmap
+     where merchno=:hi_orgi_merchno;
+    if(SQLCODE)
+    {
+        db_chk_err(__FILE__, __LINE__, &sqlca);
+        LOG(ERROR, "QueryVirtualMerchno failed sqlcode=" << SQLCODE << ",merchno=" << orgi_merchno);
+        return SQLCODE;
+    }
+    trim(ho_virtual_merchno);
+    strcpy(virtual_merchno, ho_virtual_merchno);
+    return 0;
+}
+static int QueryVirtualTermno(const char* orgi_termno, const char* merchno, char* virtual_termno)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_merchno[16] = {0};
+        char hi_orgi_termno[9] = {0};
+        char ho_virtual_termno[9] = {0};
+    EXEC SQL END DECLARE SECTION;
+    des2src(hi_orgi_termno, orgi_termno);
+    SQLCODE = 0;
+    des2src(hi_merchno, merchno);
+    EXEC SQL
+     select vtermno into
+     :ho_virtual_termno
+     from t_termmap
+     where termno=:hi_orgi_termno and merchno=:hi_merchno;
+    if(SQLCODE)
+    {
+        db_chk_err(__FILE__, __LINE__, &sqlca);
+        LOG(ERROR, "QueryVirtualTermno failed sqlcode=" << SQLCODE << ",termno=" << orgi_termno << ",merchno=" << merchno);
+        return SQLCODE;
+    }
+    trim(ho_virtual_termno);
+    strcpy(virtual_termno, ho_virtual_termno);
+    return 0;
+}
+int CheckStatusError()
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        int ho_error_cnt = 0;
+    EXEC SQL END DECLARE SECTION;
+    SQLCODE = 0;
+    EXEC SQL
+    select count(*) into :ho_error_cnt
+    from t_upayposdata
+    where status=2;
+    if(SQLCODE)
+    {
+        db_chk_err(__FILE__, __LINE__, &sqlca);
+        return SQLCODE;
+    }
+    if(ho_error_cnt > 0)
+        return 1;
+    return 0;
+}
+int CreateTask()
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_dbdatetime[20] = {0};
+        int ho_cnt = 0;
+    EXEC SQL END DECLARE SECTION;
+    SQLCODE = 0;
+    int ret = db_getsysdatetime2(hi_dbdatetime);
+    if(ret)
+        return ret;
+    SQLCODE = 0;
+    if(gTaskType)
+    {
+        EXEC SQL
+         update t_upayposdata
+         set status=9,
+         batchno=:hi_dbdatetime
+         where status=8;
+        if(SQLCODE)
+        {
+            db_chk_err(__FILE__, __LINE__, &sqlca);
+            if(DB_NOTFOUND == SQLCODE)
+                return 0;
+            else
+                return SQLCODE;
+        }
+    }
+    else
+    {
+        EXEC SQL
+         update t_upayposdata
+         set status=1,
+         batchno=:hi_dbdatetime
+         where status=0;
+        if(SQLCODE)
+        {
+            db_chk_err(__FILE__, __LINE__, &sqlca);
+            if(DB_NOTFOUND == SQLCODE)
+                return 0;
+            else
+                return SQLCODE;
+        }
+    }
+    //创建任务
+    T_t_upaytask upaytask;
+    memset(&upaytask, 0, sizeof(upaytask));
+    des2src(upaytask.batchno, hi_dbdatetime);
+    upaytask.status = 1;
+    upaytask.tasktype = gTaskType;
+    des2src(upaytask.updtime, hi_dbdatetime);
+    ret = DB_t_upaytask_add(&upaytask);
+    if(ret)
+    {
+        LOG(ERROR, "add new task failed");
+        return SQLCODE;
+    }
+    LOG(INFO, "add new task ok");
+    return 0;
+}
+int CheckTaskNoParsed(const char* batchno)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_batchno[21] = {0};
+        int ho_cnt = 0;
+    EXEC SQL END DECLARE SECTION;
+    des2src(hi_batchno, batchno);
+    SQLCODE = 0;
+    EXEC SQL
+    select count(*) into :ho_cnt
+    from t_upayposdata
+    where batchno=:hi_batchno and status < 3;
+    if(SQLCODE)
+    {
+        db_chk_err(__FILE__, __LINE__, &sqlca);
+        return SQLCODE;
+    }
+    if(ho_cnt > 0)
+        return 1;
+    return 0;
+}
+int GetPosDataVect(const char* batchno, int status, POSDATAVECT& posdataVect)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_batchno[21] = {0};
+        int hi_status = status;
+        int ho_posdataid = 0;
+    EXEC SQL END DECLARE SECTION;
+    int ret = 0;
+    if(posdataVect.size())
+        posdataVect.clear();
+    SQLCODE = 0;
+    des2src(hi_batchno, batchno);
+    EXEC SQL DECLARE posdata_cur CURSOR FOR
+     SELECT /*+ FIRST_ROWS */ posdataid
+     FROM t_upayposdata
+     where batchno=:hi_batchno and  status=:hi_status order by posdataid;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_DECLARE;
+    }
+    EXEC SQL    OPEN posdata_cur;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_OPEN;
+    }
+    while(1)
+    {
+        ho_posdataid = 0;
+        EXEC SQL FETCH posdata_cur INTO
+        :ho_posdataid;
+        if(SQLCODE)
+        {
+            ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE posdata_cur;
+            if(DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+                return ret;
+        }
+        posdataVect.push_back(ho_posdataid);
+    }
+    return 0;
+}
+int GetPosDataVectByVMerchno(const char* batchno, const char* vmerchno, int status, POSDATAVECT& posdataVect)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_batchno[21] = {0};
+        int  hi_status = status;
+        char hi_vmerchno[16] = {0};
+        int ho_posdataid = 0;
+    EXEC SQL END DECLARE SECTION;
+    int ret = 0;
+    if(posdataVect.size())
+        posdataVect.clear();
+    des2src(hi_batchno, batchno);
+    des2src(hi_vmerchno, vmerchno);
+    SQLCODE = 0;
+    EXEC SQL DECLARE merchposdata_cur CURSOR FOR
+     SELECT  posdataid
+     FROM t_upayposdata
+     where batchno=:hi_batchno and vmerchno=:hi_vmerchno
+     and status = :hi_status
+     order by posdataid;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_DECLARE;
+    }
+    EXEC SQL    OPEN merchposdata_cur;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_OPEN;
+    }
+    while(1)
+    {
+        ho_posdataid = 0;
+        EXEC SQL FETCH merchposdata_cur INTO
+        :ho_posdataid;
+        if(SQLCODE)
+        {
+            ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE merchposdata_cur;
+            if(DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+                return ret;
+        }
+        posdataVect.push_back(ho_posdataid);
+    }
+    return 0;
+}
+
+int GetVMerchVect(const char* batchno, VMERCHVECT& VMerchVect)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_batchno[21] = {0};
+        char ho_vmerchno[16] = {0};
+        short ho_idr;
+    EXEC SQL END DECLARE SECTION;
+    int ret = 0;
+    if(VMerchVect.size())
+        VMerchVect.clear();
+    SQLCODE = 0;
+    des2src(hi_batchno, batchno);
+    EXEC SQL DECLARE vmerch_cur CURSOR FOR
+     SELECT vmerchno
+     FROM t_upayposdata
+     where batchno=:hi_batchno group by vmerchno;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_DECLARE;
+    }
+    EXEC SQL    OPEN vmerch_cur;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_OPEN;
+    }
+    while(1)
+    {
+        ho_vmerchno[0] = 0;
+        EXEC SQL FETCH vmerch_cur INTO
+        :ho_vmerchno:ho_idr;
+        if(SQLCODE)
+        {
+            ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE vmerch_cur;
+            if(DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+                return ret;
+        }
+        trim(ho_vmerchno);
+        VMerchVect.push_back(string(ho_vmerchno));
+    }
+    return 0;
+}
+/*
+int GetPosFileVect(const char* batchno, POSFILEVECT& PosFileVect)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_batchno[21] = {0};
+        char ho_vmerchno[16] = {0};
+        char ho_filename[256] = {0};
+        int  ho_status = 0;
+        short ho_idr = 0;
+    EXEC SQL END DECLARE SECTION;
+    int ret = 0;
+    if(PosFileVect.size())
+        PosFileVect.clear();
+    SQLCODE = 0;
+    des2src(hi_batchno, batchno);
+    EXEC SQL DECLARE posfile_cur CURSOR FOR
+     SELECT vmerchno,filename,status
+     FROM t_upayfile
+     where batchno=:hi_batchno;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_DECLARE;
+    }
+    EXEC SQL    OPEN posfile_cur;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_OPEN;
+    }
+    while(1)
+    {
+        ho_vmerchno[0] = 0;
+        ho_filename[0] = 0;
+        ho_status = 0;
+        EXEC SQL FETCH posfile_cur INTO
+        :ho_vmerchno:ho_idr,
+        :ho_filename:ho_idr,
+        :ho_status:ho_idr;
+        if(SQLCODE)
+        {
+            ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE posfile_cur;
+            if(DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+                return ret;
+        }
+        T_t_upayfile upayfile;
+        memset(&upayfile, 0, sizeof(upayfile));
+        des2src(upayfile.batchno, batchno);
+        des2src(upayfile.vmerchno, ho_vmerchno);
+        des2src(upayfile.filename, ho_filename);
+        upayfile.status = ho_status;
+        PosFileVect.push_back(upayfile);
+    }
+    return 0;
+}
+*/
+int CreateMerchFileBatchno(const char* batchno, int takstype, const char* vmerchno, T_t_upayfile& upayfile)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char hi_dbdatetime[21] = {0};
+        char hi_batchno[21] = {0};
+        char hi_vmerchno[16] = {0};
+        int hi_transdate = 0;
+        int ho_cnt = 0;
+        short ho_idr;
+    EXEC SQL END DECLARE SECTION;
+
+    des2src(hi_batchno, batchno);
+    des2src(hi_vmerchno, vmerchno);
+    int ret = db_getsysdatetime2(hi_dbdatetime);
+    if(ret)
+        return ret;
+    SQLCODE = 0;
+    EXEC SQL
+     select filebatchno into :ho_cnt
+     from t_upayfile
+     where vmerchno=:hi_vmerchno and batchno=:hi_batchno;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        if(DB_NOTFOUND != SQLCODE)
+            return SQLCODE;
+    }
+    else
+    {
+        return 0;
+    }
+    SQLCODE = 0;
+    hi_transdate = atoi(string(hi_dbdatetime, 8).c_str());
+    EXEC SQL
+     select max(filebatchno) into :ho_cnt:ho_idr
+     from t_upayfile where vmerchno=:hi_vmerchno and transdate=:hi_transdate;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return SQLCODE;
+    }
+    memset(&upayfile, 0, sizeof(upayfile));
+    des2src(upayfile.batchno, batchno);
+    des2src(upayfile.vmerchno, vmerchno);
+    upayfile.transdate = hi_transdate;
+    upayfile.filebatchno = ho_cnt + 1;
+    if(takstype)
+        sprintf(upayfile.filename, "%s%15s_%08d_I22_%02d.txt", config_obj.expirefilepath.c_str(), vmerchno, upayfile.transdate, upayfile.filebatchno);
+    else
+        sprintf(upayfile.filename, "%15s_%08d_I22_%02d.txt", vmerchno, upayfile.transdate, upayfile.filebatchno);
+    des2src(upayfile.updtime, hi_dbdatetime);
+    ret = DB_t_upayfile_add(&upayfile);
+    if(ret)
+    {
+        return ret;
+    }
+    return 0;
+}
+int GetPosTaskVect(POSTASKVECT& TaskVect, int status)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        char ho_batchno[21] = {0};
+        int ho_tasktype = 0;
+        int hi_status = status;
+        int hi_tasktype = gTaskType;
+        short ho_idr;
+    EXEC SQL END DECLARE SECTION;
+    int ret = 0;
+    if(TaskVect.size())
+        TaskVect.clear();
+    SQLCODE = 0;
+    EXEC SQL DECLARE postask_cur CURSOR FOR
+     SELECT /*+ FIRST_ROWS */
+     batchno,
+     tasktype
+     FROM t_upaytask
+     where  status=:hi_status and tasktype=:hi_tasktype order by batchno;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_DECLARE;
+    }
+    EXEC SQL    OPEN postask_cur;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_OPEN;
+    }
+    while(1)
+    {
+        ho_batchno[0] = 0;
+        EXEC SQL FETCH postask_cur INTO
+        :ho_batchno:ho_idr,
+        :ho_tasktype:ho_idr;
+        if(SQLCODE)
+        {
+            ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE postask_cur;
+            if(DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+                return ret;
+        }
+        T_t_upaytask upaytask;
+        memset(&upaytask, 0, sizeof(upaytask));
+        des2src(upaytask.batchno, ho_batchno);
+        upaytask.tasktype = ho_tasktype;
+        TaskVect.push_back(upaytask);
+    }
+    return 0;
+}
+
+int ParsePosData(const char* batchno, const char* parserName)
+{
+    int ret = 0;
+    Ks8583Parser* pParser = Ks8583Parser::GetInstance(parserName);
+    if(!pParser)
+    {
+        LOG(ERROR, "get 8583 parser instance failed");
+        return -1;
+    }
+    CUnionPayPos unionPayPos(*pParser);
+    POSDATAVECT posdataVect;
+    ret = GetPosDataVect(batchno, 1, posdataVect);
+    if(ret)
+    {
+        LOG(ERROR, "GetPosDataVect ret=" << ret);
+        return ret;
+    }
+    if(posdataVect.size() < 1)
+    {
+        return 0;
+    }
+    for(size_t i = 0; i < posdataVect.size(); i++)
+    {
+        char dbdatetime[20] = {0};
+        ret = db_getsysdatetime2(dbdatetime);
+        if(ret)
+            return ret;
+        POSDTLFILE  PosdtlFile;
+        memset(&PosdtlFile, 0, sizeof(PosdtlFile));
+        int id = posdataVect[i];
+        //修改记录状态
+        T_t_upayposdata  tPosData;
+        memset(&tPosData, 0, sizeof(tPosData));
+        ret = DB_t_upayposdata_read_lock_by_c0_and_posdataid(id, &tPosData);
+        if(ret)
+        {
+            LOG(ERROR, "DB_t_upayposdata_read_lock_by_c0_and_posdataid ret=" << ret << ",posdataid=" << id);
+            return ret;
+        }
+        if(tPosData.status != 1)
+        {
+            LOG(ERROR, "posdata status error posdataid=" << id << ",status=" << tPosData.status);
+            DB_t_upayposdata_free_lock_by_c0();
+            return -1;
+        }
+        string msgtype;
+        int infocode;
+        if(!unionPayPos.getMsgType(tPosData.posdata, strlen(tPosData.posdata), msgtype, infocode))
+        {
+            LOG(ERROR, "getMsgType error,parse pos data failed" << ",posdataid=" << id);
+            return -2;
+        }
+        if(!unionPayPos.parsePosData(PosdtlFile, true))
+        {
+            LOG(ERROR, "parse pos data error,posdataid=" << id);
+            strcpy(tPosData.remark, "parse data error");
+            tPosData.status = 5;
+            des2src(tPosData.updtime, dbdatetime);
+            ret = DB_t_upayposdata_update_lock_by_c0(&tPosData);
+            if(ret)
+            {
+                LOG(ERROR, "update error ret=" << ret << ",posdataid=" << id);
+                return ret;
+            }
+            return 0;
+        }
+        //tPosData.recordtype = unionPayPos.m_nRecordType;
+        des2src(tPosData.merchno, PosdtlFile.merchno);
+        des2src(tPosData.termno, PosdtlFile.termno);
+        ret = QueryVirtualMerchno(tPosData.merchno, tPosData.vmerchno);
+        if(ret)
+        {
+            LOG(ERROR, "QueryVirtualMerchno error,posdataid=" << id);
+            strcpy(tPosData.remark, "query virtual merchno error");
+            tPosData.status = 2;
+            des2src(tPosData.updtime, dbdatetime);
+            ret = DB_t_upayposdata_update_lock_by_c0(&tPosData);
+            if(ret)
+            {
+                LOG(ERROR, "update error ret=" << ret << ",posdataid=" << id);
+                return ret;
+            }
+            return 0;
+        }
+        ret = QueryVirtualTermno(tPosData.termno, tPosData.merchno, tPosData.vtermno);
+        if(ret)
+        {
+            LOG(ERROR, "QueryVirtualTermno error,posdataid=" << id);
+            strcpy(tPosData.remark, "query virtual termno error");
+            tPosData.status = 2;
+            des2src(tPosData.updtime, dbdatetime);
+            ret = DB_t_upayposdata_update_lock_by_c0(&tPosData);
+            if(ret)
+            {
+                LOG(ERROR, "update error ret=" << ret << ",posdataid=" << id);
+                return ret;
+            }
+            return 0;
+        }
+        //增加日期有效性判断
+        //MMDDhhmmss
+        string dateStr(dbdatetime, 4);
+        dateStr.append(PosdtlFile.transtime, 4);
+        if(!isValidDate(dateStr))
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",transtime[" << dateStr << "] is invalid");
+            memcpy(PosdtlFile.transtime, dbdatetime + 4, 4);
+            /*
+                sprintf(tPosData.remark, "transtime[%s] invalid", dateStr.c_str());
+                tPosData.status = 2;
+                des2src(tPosData.updtime, dbdatetime);
+                ret = DB_t_upayposdata_update_lock_by_c0(&tPosData);
+                if(ret)
+                {
+                    LOG(ERROR, "update error ret=" << ret << ",posdataid=" << id);
+                    return ret;
+                }
+                return 0;
+                    */
+        }
+        //YYMMDD
+        dateStr = "20";
+        dateStr.append(PosdtlFile.transdate, 6);
+        if(!isValidDate(dateStr))
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",transdate[" << dateStr << "] is invalid");
+            memcpy(PosdtlFile.transdate, dbdatetime + 2, 6);
+            /*
+                sprintf(tPosData.remark, "transdate[%s] invalid", dateStr.c_str());
+                tPosData.status = 2;
+                des2src(tPosData.updtime, dbdatetime);
+                ret = DB_t_upayposdata_update_lock_by_c0(&tPosData);
+                if(ret)
+                {
+                    LOG(ERROR, "update error ret=" << ret << ",posdataid=" << id);
+                    return ret;
+                }
+                return 0;
+                */
+        }
+        string timeStr(PosdtlFile.transtime + 4, 6);
+        if(!isValidTime(timeStr))
+        {
+            LOG(INFO, "posdataid=" << tPosData.posdataid << ",transtime[" << timeStr << "] is invalid");
+            memcpy(PosdtlFile.transtime + 4, "235959", 6);
+        }
+        dateStr = "20";
+        dateStr.append(PosdtlFile.cardexpiredate, 4);
+        dateStr.append("01");
+        if(!isValidDate(dateStr))
+        {
+            LOG(INFO, "posdataid=" << tPosData.posdataid << ",expiredate[" << dateStr << "] is invalid");
+            memcpy(PosdtlFile.cardexpiredate, "3012", 4);
+        }
+        memset(PosdtlFile.merchno, 0x20, sizeof(PosdtlFile.merchno));
+        memset(PosdtlFile.termno, 0x20, sizeof(PosdtlFile.termno));
+        strncpy(PosdtlFile.merchno, tPosData.vmerchno, strlen(tPosData.vmerchno));
+        strncpy(PosdtlFile.termno, tPosData.vtermno, strlen(tPosData.vtermno));
+        tPosData.termseqno = atoi(string(PosdtlFile.termseqno, sizeof(PosdtlFile.termseqno)).c_str());
+        memset(PosdtlFile.termseqno, 0x20, sizeof(PosdtlFile.termseqno)); //按银联要求
+        strncpy(tPosData.termdate, "20", 2);
+        strncpy(tPosData.termdate + 2, PosdtlFile.transdate, 6);
+        strncpy(tPosData.termtime, PosdtlFile.transtime + 4, 6);
+        des2src(tPosData.cardno, PosdtlFile.cardno);
+        tPosData.cardcnt = strtol(string(PosdtlFile.apptranscnt, 4).c_str(), NULL, 16);
+        tPosData.amount = atoi(string(PosdtlFile.transamt, sizeof(PosdtlFile.transamt)).c_str());
+        memcpy(tPosData.filedata, &PosdtlFile, sizeof(PosdtlFile));
+        memset(tPosData.remark, 0, sizeof(tPosData.remark));
+        tPosData.status = 3;
+        T_t_upayposdtl upayposdtl;
+        memset(&upayposdtl, 0, sizeof(upayposdtl));
+        upayposdtl.posdataid = tPosData.posdataid;
+        des2src(upayposdtl.termno, PosdtlFile.termno);
+        upayposdtl.termseqno = tPosData.termseqno;
+        upayposdtl.termbatchno = unionPayPos.m_nBatchno;
+        upayposdtl.recordtype = unionPayPos.m_nRecordType;
+        des2src(upayposdtl.termdate, tPosData.termdate);
+        des2src(upayposdtl.termtime, tPosData.termtime);
+        des2src(upayposdtl.merchno, tPosData.merchno);
+        upayposdtl.amount = tPosData.amount;
+        upayposdtl.cardcnt = tPosData.cardcnt;
+        des2src(upayposdtl.cardno, PosdtlFile.cardno);
+        upayposdtl.settledate = atoi(string(dbdatetime, 8).c_str());
+        upayposdtl.status = 1;
+        des2src(upayposdtl.vmerchno, tPosData.vmerchno);
+        des2src(upayposdtl.vtermno, tPosData.vtermno);
+        des2src(upayposdtl.updtime, dbdatetime);
+        if(strlen(upayposdtl.cardno) < 1)
+        {
+            upayposdtl.status = 2;
+            tPosData.status = 7;
+            strcpy(tPosData.remark, "data error:bankcardno is empty");
+        }
+        ret = DB_t_upayposdtl_add(&upayposdtl);
+        if(ret)
+        {
+            if(DB_REPEAT == ret)
+            {
+                tPosData.status = 6;
+                sprintf(tPosData.remark, "data repeated:cardno[%s]cardcnt[%d]", tPosData.cardno, tPosData.cardcnt);
+            }
+            else
+            {
+                DB_t_upayposdata_free_lock_by_c0();
+                LOG(ERROR, "DB_t_upayposdtl_add ret=" << ret << ",posdataid=" << id);
+                return -1;
+            }
+        }
+        else
+        {
+            //判断是否过期,如果过期则标志状态为9
+            char szExpireDate[9] = {0};
+            calcEndDate(tPosData.termdate, config_obj.expiredays, szExpireDate);
+            if(strncmp(dbdatetime, szExpireDate, 8) >= 0)
+            {
+                tPosData.status = 8;
+                strcpy(tPosData.remark, "termdate is out of date");
+            }
+        }
+        //灰记录
+        if(0xF1 == unionPayPos.m_nRecordType)
+        {
+            tPosData.status = 5;
+            strcpy(tPosData.remark, "gray records");
+        }
+        des2src(tPosData.updtime, dbdatetime);
+        ret = DB_t_upayposdata_update_lock_by_c0(&tPosData);
+        if(ret)
+        {
+            LOG(ERROR, "update error ret=" << ret << ",posdataid=" << id);
+            return ret;
+        }
+    }
+    return 0;
+}
+int CreatePosFile(T_t_upayfile& upayfile, int tasktype)
+{
+    int ret = 0;
+    POSDATAVECT posdataVect;
+    int datastatus = 3;
+    if(tasktype)
+        datastatus = 9;
+    ret = GetPosDataVectByVMerchno(upayfile.batchno, upayfile.vmerchno, datastatus, posdataVect);
+    if(ret)
+    {
+        LOG(ERROR, "GetPosDataVect ret=" << ret);
+        return ret;
+    }
+    if(posdataVect.size() < 1)
+    {
+        LOG(WARN, "no data read batchno=" << upayfile.batchno << ",vermchno=" << upayfile.vmerchno);
+        return 0;
+    }
+    ofstream file;
+    file.open(upayfile.filename, ios_base::binary | ios_base::trunc);
+    if(file.fail())
+    {
+        LOG(ERROR, "open " << upayfile.filename << " failed");
+        return -1;
+    }
+    for(size_t i = 0; i < posdataVect.size(); i++)
+    {
+        char dbdatetime[20] = {0};
+        ret = db_getsysdatetime2(dbdatetime);
+        if(ret)
+        {
+            remove(upayfile.filename);
+            file.close();
+            return ret;
+        }
+        POSDTLFILE  PosdtlFile;
+        memset(&PosdtlFile, 0, sizeof(PosdtlFile));
+        int id = posdataVect[i];
+        //修改记录状态
+        T_t_upayposdata  tPosData;
+        memset(&tPosData, 0, sizeof(tPosData));
+        ret = DB_t_upayposdata_read_lock_by_c0_and_posdataid(id, &tPosData);
+        if(ret)
+        {
+            file.close();
+            LOG(ERROR, "DB_t_upayposdata_read_lock_by_c0_and_posdataid ret=" << ret << ",posdataid=" << id);
+            remove(upayfile.filename);
+            return ret;
+        }
+        if(tPosData.status != datastatus)
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",posdata status error posdataid=" << id << ",status=" << tPosData.status);
+            DB_t_upayposdata_free_lock_by_c0();
+            file.close();
+            remove(upayfile.filename);
+            return -1;
+        }
+        tPosData.status = 4;
+        des2src(tPosData.updtime, dbdatetime);
+        ret = DB_t_upayposdata_update_lock_by_c0(&tPosData);
+        if(ret)
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",update error ret=" << ret << ",posdataid=" << id);
+            file.close();
+            remove(upayfile.filename);
+            return ret;
+        }
+        memset(&PosdtlFile, 0x20, sizeof(PosdtlFile));
+        memcpy(&PosdtlFile, tPosData.filedata, strlen(tPosData.filedata));
+        //增加日期有效性判断
+        //check begin
+        //MMDDhhmmss
+        string dateStr(dbdatetime, 4);
+        dateStr.append(PosdtlFile.transtime, 4);
+        if(!isValidDate(dateStr))
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",transtime[" << dateStr << "] is invalid");
+            memcpy(PosdtlFile.transtime, dbdatetime + 4, 4);
+        }
+        string timeStr(PosdtlFile.transtime + 4, 6);
+        if(!isValidTime(timeStr))
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",transtime[" << timeStr << "] is invalid");
+            memcpy(PosdtlFile.transtime + 4, "235959", 6);
+        }
+        //YYMMDD
+        dateStr = "20";
+        dateStr.append(PosdtlFile.transdate, 6);
+        if(!isValidDate(dateStr))
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",transdate[" << dateStr << "] is invalid");
+            memcpy(PosdtlFile.transdate, dbdatetime + 2, 6);
+        }
+        //YYMM
+        dateStr = "20";
+        dateStr.append(PosdtlFile.cardexpiredate, 4);
+        dateStr.append("01");
+        if(!isValidDate(dateStr))
+        {
+            LOG(INFO, "posdataid=" << tPosData.posdataid << ",expiredate[" << dateStr << "] is invalid");
+            memcpy(PosdtlFile.cardexpiredate, "3012", 4);
+        }
+        //check end
+        memcpy(PosdtlFile.crlf, "\x0D\x0A", 2);
+        file.write((char*)&PosdtlFile, sizeof(PosdtlFile));
+        if(file.bad())
+        {
+            LOG(ERROR, "posdataid=" << tPosData.posdataid << ",write file " << upayfile.filename << " failed");
+            file.close();
+            remove(upayfile.filename);
+            return -1;
+        }
+    }
+    file.close();
+    LOG(INFO, "create unionpay file " << upayfile.filename << " OK");
+    return 0;
+}
+int PrepareTask(const T_t_upaytask& task, const char* parserName)
+{
+    int ret = 0;
+    if(0 == task.tasktype)
+    {
+        ret = ParsePosData(task.batchno, parserName);
+        if(ret)
+        {
+            LOG(ERROR, "ParsePosData ret=" << ret << ",batchno=" << task.batchno);
+            return ret;
+        }
+        //判断是否有未解析的数据
+        ret = CheckTaskNoParsed(task.batchno);
+        if(ret)
+        {
+            LOG(ERROR, "CheckTaskNoParsed ret=" << ret << ",batchno=" << task.batchno);
+            return ret;
+        }
+        ret = db_commit();
+        if(ret)
+        {
+            return ret;
+        }
+    }
+    T_t_upaytask  upaytask;
+    memset(&upaytask, 0, sizeof(upaytask));
+    ret = DB_t_upaytask_read_lock_by_c0_and_batchno(task.batchno, &upaytask);
+    if(ret)
+    {
+        return ret;
+    }
+    if(upaytask.status != 1)
+    {
+        DB_t_upaytask_free_lock_by_c0();
+        LOG(ERROR, "status error");
+        return -1;
+    }
+    upaytask.status = 2;
+    db_getsysdatetime2(upaytask.updtime);
+    ret = DB_t_upaytask_update_lock_by_c0(&upaytask);
+    if(ret)
+    {
+        return ret;
+    }
+    return 0;
+}
+int ProcessTask(const T_t_upaytask& task)
+{
+    int ret = 0;
+    VMERCHVECT VMerchVect;
+    ret = GetVMerchVect(task.batchno, VMerchVect);
+    if(ret)
+    {
+        LOG(ERROR, "GetVMerchVect ret=" << ret << ",batchno=" << task.batchno);
+        return ret;
+    }
+    for(size_t k = 0; k < VMerchVect.size(); k++)
+    {
+        //判断是否有未解析的数据
+        T_t_upayfile upayfile;
+        memset(&upayfile, 0, sizeof(upayfile));
+        ret = CreateMerchFileBatchno(task.batchno, task.tasktype, VMerchVect[k].c_str(), upayfile);
+        if(ret)
+        {
+            LOG(ERROR, "CreateMerchFileBatchno ret=" << ret << ",batchno=" << task.batchno << ",vmerchno=" << VMerchVect[k]);
+            return ret;
+        }
+        ret = CreatePosFile(upayfile, task.tasktype);
+        if(ret)
+        {
+            LOG(ERROR, "CreatePosFile ret=" << ret << ",batchno=" << task.batchno << ",vmerchno=" << VMerchVect[k]);
+            return ret;
+        }
+    }
+    T_t_upaytask  upaytask;
+    memset(&upaytask, 0, sizeof(upaytask));
+    ret = DB_t_upaytask_read_lock_by_c0_and_batchno(task.batchno, &upaytask);
+    if(ret)
+    {
+        return ret;
+    }
+    if(upaytask.status != 2)
+    {
+        DB_t_upaytask_free_lock_by_c0();
+        LOG(ERROR, "status error");
+        return -1;
+    }
+    upaytask.status = 3;
+    db_getsysdatetime2(upaytask.updtime);
+    ret = DB_t_upaytask_update_lock_by_c0(&upaytask);
+    if(ret)
+    {
+        return ret;
+    }
+    return 0;
+}
+static bool init_config(string pathname)
+{
+    try
+    {
+        ConfigFile config(pathname);
+        try
+        {
+
+            config.readInto(config_obj.connectinfo, "connectinfo");
+            config.readInto(config_obj.logconf, "logconf");
+            config.readInto(config_obj.expiredays, "expiredays");
+            config.readInto(config_obj.expirefilepath, "expirefilepath");
+        }
+        catch(ConfigFile::key_not_found& ex)
+        {
+            cout << "read " << ex.key << " faild" << endl;
+            return false;
+        }
+        return true;
+    }
+    catch(ConfigFile::file_not_found& ex)
+    {
+        cout << "read file " << ex.filename << " faild " << endl;
+        return false;
+    }
+}
+int  main(int argc, char *argv[])
+{
+
+    int ret = 0;
+    char  szVerNo[61] = {0};
+    sprintf(szVerNo, "%s %s (%s %s)", argv[0], YKT_VERSION, __DATE__, __TIME__);
+    const char short_opts[] = "ehvcp";
+    int option;
+    gTaskType = 0;
+    bool bOnlyParse = false;
+    bool bOnlyCreateFile = false;
+    while((option = getopt(argc, argv, short_opts)) != -1)
+    {
+        switch(option)
+        {
+            case 'v':
+            case 'V':
+                printf("%s\n", szVerNo);
+                return 0;
+            case 'e':
+            case 'E':
+                gTaskType = 1;
+                break;
+            case 'h':
+                printf("usage: upayfilesvr [options]\noptions:\n\t-c only create file(no parse)\n\t-p only parse(no create file)\n\t-e create expired file\n\t-h help\n\t-v version\n");
+                return 0;
+            case 'p':
+            case 'P':
+                bOnlyParse = true;
+                bOnlyCreateFile = false;
+                break;
+            case 'c':
+            case 'C':
+                bOnlyCreateFile = true;
+                bOnlyParse = false;
+                break;
+            default:
+                printf("usage: upayfilesvr [options]\noptions:\n\t-c only create file(no parse)\n\t-p only parse(no create file)\n\t-e create expired file\n\t-h help\n\t-v version\n");
+                return 0;
+        }
+    }
+    string conf = argv[0];
+    conf = conf + ".conf";
+
+    if(!init_config(conf))
+    {
+        cout << "init_config failed!";
+        return -1;
+    }
+    if(!init_logger(config_obj.logconf))
+    {
+        cout << "server init log faild" << endl;
+        return -2;
+    }
+    if(config_obj.expirefilepath.size() < 1)
+    {
+        LOG(ERROR, conf << ":expirefilepath should not be NULL");
+        return -3;
+    }
+    if(*(config_obj.expirefilepath.rbegin()) != '/')
+    {
+        config_obj.expirefilepath.append("/");
+    }
+    if(!CreateDirectory(config_obj.expirefilepath.c_str()))
+    {
+        LOG(ERROR, "create directory failed");
+        return -4;
+    }
+    char parserName[128] = {0};
+    ret = Ks8583Parser::Load8583Define("unionpaypos.dat", parserName);
+    if(ret)
+    {
+        LOG(ERROR, "load unionpaypos.dat configfile failed! ret=" << ret);
+        return ret;
+    }
+    LOG(DEBUG, "load " << parserName << " 8583 configfile OK");
+    LOG(DEBUG, "init ok");
+    while(1)
+    {
+        ret = ConnectDb(config_obj.connectinfo.c_str());
+        if(ret)
+        {
+            LOG(ERROR, "连接数据库失败，系统启动失败");
+            return ret;
+        }
+        LOG(INFO, "database is connected ");
+        ret = CheckStatusError();
+        if(ret)
+        {
+            LOG(ERROR, "check posdata status error");
+            return -1;
+        }
+        POSTASKVECT TaskVect;
+        if(!bOnlyCreateFile)
+        {
+            //创建任务
+            ret = CreateTask();
+            if(ret)
+            {
+                db_rollback();
+                db_disconnect();
+                return -1;
+            }
+            ret = db_commit();
+            if(ret)
+                return ret;
+            ret = GetPosTaskVect(TaskVect, 1);
+            if(ret)
+                return ret;
+            for(size_t i = 0; i < TaskVect.size(); i++)
+            {
+                ret = PrepareTask(TaskVect[i], parserName);
+                if(ret)
+                {
+                    db_rollback();
+                    db_disconnect();
+                    return ret;
+                }
+                ret = db_commit();
+                if(ret)
+                    return ret;
+            }
+            ret = CheckStatusError();
+            if(ret)
+            {
+                LOG(ERROR, "check posdata status error");
+                db_disconnect();
+                return ret;
+            }
+            if(bOnlyParse)
+                break;
+        }
+        ret = GetPosTaskVect(TaskVect, 2);
+        if(ret)
+            return ret;
+        if(TaskVect.size() < 1)
+        {
+            LOG(INFO, "no data found");
+            break;
+        }
+        for(size_t i = 0; i < TaskVect.size(); i++)
+        {
+            ret = ProcessTask(TaskVect[i]);
+            if(ret)
+            {
+                db_rollback();
+                db_disconnect();
+                return ret;
+            }
+            ret = db_commit();
+            if(ret)
+                return ret;
+        }
+        break;
+    }
+    db_commit();
+    db_disconnect();
+    LOG(DEBUG, "exit");
+    return 0;
+}
+

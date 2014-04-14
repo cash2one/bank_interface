@@ -1,0 +1,468 @@
+/* ----------------------------------------------------------
+ * 创建日期：2012-3-9
+ * 程序作者：闻剑
+ * 版本信息：3.0.0.0
+ * 程序功能：处理银联对账文件
+ * ----------------------------------------------------------*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "errdef.h"
+#include "pubdef.h"
+#include "pubdb.h"
+#include "pubfunc.h"
+#include "dbfunc.h"
+#include "dbfunc_foo.h"
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <iomanip>
+#include <dirent.h>
+
+#include "ConfigFile.h"
+#include "logger_imp.h"
+using namespace std;
+
+EXEC SQL INCLUDE SQLCA;
+typedef struct
+{
+    char settledate[8];
+    char transcode[3];
+    char sys_tra_no[6];
+    char mmddhhmiss[10];
+    char accept_ins[11];
+    char fwd_ins[11];
+    char issueinst[11];
+    char acctno[19];
+    char transamt[12];
+    char merchtype[4];
+    char refno[12];
+    char authcode[6];
+    char termno[8];
+    char merchno[15];
+    char merchname[40];
+    char merchdrfee[8];
+    char merchcrfee[8];
+    char transtatus[5];
+    char reserved1[100];
+} ST_UPAYCHKFILE;
+
+static int GetNextChkFileID(int* id)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        int ho_id = 0;
+    EXEC SQL END DECLARE SECTION;
+    SQLCODE = 0;
+    EXEC SQL
+    SELECT  S_UPAYCHKFILE_ID.nextval into:ho_id FROM dual;
+    if(SQLCODE)
+    {
+        db_chk_err(__FILE__, __LINE__, &sqlca);
+        if(SQLCODE == -2289)
+        {
+            DynamicStmtExecute("CREATE SEQUENCE S_UPAYCHKFILE_ID INCREMENT BY 1 START WITH 1  MAXVALUE 999999999 CYCLE NOCACHE  ORDER");
+            return SQLCODE;
+        }
+        else
+        {
+            LOG(ERROR, "生成POS流水ID错误 ret=" << SQLCODE);
+            return SQLCODE;
+        }
+    }
+    *id = ho_id;
+    return 0;
+}
+static void ScanDir(const char *dir, vector<string>& FileList)
+{
+    DIR *dp;
+    struct dirent *entry;
+    struct stat statbuf;
+
+    if((dp = opendir(dir)) == NULL)
+    {
+        fprintf(stderr, "cannot open directory: %s\n", dir);
+        return;
+    }
+    chdir(dir);
+    while((entry = readdir(dp)) != NULL)
+    {
+        lstat(entry->d_name, &statbuf);
+        if(S_ISDIR(statbuf.st_mode))
+        {
+            continue;
+        }
+        FileList.push_back(entry->d_name);
+    }
+    chdir("..");
+    closedir(dp);
+}
+int InsertCheckFile(const char* checkfile, int& fileid)
+{
+    int ret = 0;
+    T_t_upaychkfile upaychkfile;
+    memset(&upaychkfile, 0, sizeof(upaychkfile));
+
+    const char* pDate = strrchr(checkfile, '_');
+    if(!pDate)
+    {
+        LOG(ERROR, "checkfile[" << checkfile << "] filename is not expected");
+        return E_COMMON_ERR;
+    }
+    upaychkfile.settledate = atoi(pDate + 1);
+    ret = GetNextChkFileID(&(fileid));
+    if(ret)
+    {
+        LOG(ERROR, "GetNextChkFileID ret=" << ret);
+        return ret;
+    }
+    upaychkfile.fileid = fileid;
+    des2src(upaychkfile.chkfilename, checkfile);
+    upaychkfile.sumtransamt = 0;
+    upaychkfile.summerchdrfee = 0;
+    upaychkfile.summerchcrfee = 0;
+    db_getsysdatetime2(upaychkfile.crttime);
+    ret = DB_t_upaychkfile_add(&upaychkfile);
+    if(ret)
+    {
+        if(DB_REPEAT == ret)
+            return 0;
+        else
+            return E_DB_ADD;
+    }
+    return 0;
+}
+inline int str2int(const string& str)
+{
+	size_t startpos = str.find_first_not_of("0");
+	if( string::npos != startpos)
+    	return atoi(str.substr(startpos).c_str());
+	else
+		return atoi(str.c_str());
+}
+static int Insert2db(int fileid, const ST_UPAYCHKFILE&  upaychkfile)
+{
+    int ret = 0;
+    T_t_upaychkdtl upaychkdtl;
+    memset(&upaychkdtl, 0, sizeof(upaychkdtl));
+
+    upaychkdtl.settledate = atol(string(upaychkfile.settledate, 8).c_str());
+    upaychkdtl.fileid = fileid;
+    des2src(upaychkdtl.transcode, string(upaychkfile.transcode, sizeof(upaychkfile.transcode)).c_str());
+    upaychkdtl.upayseqno = atoi(string(upaychkfile.sys_tra_no, sizeof(upaychkfile.sys_tra_no)).c_str());
+    des2src(upaychkdtl.termdate, string(upaychkfile.mmddhhmiss, 4).c_str());
+    des2src(upaychkdtl.termtime, string(upaychkfile.mmddhhmiss + 4, 6).c_str());
+    des2src(upaychkdtl.acceptinst, string(upaychkfile.accept_ins, sizeof(upaychkfile.accept_ins)).c_str());
+    des2src(upaychkdtl.fwdinst, string(upaychkfile.fwd_ins, sizeof(upaychkfile.fwd_ins)).c_str());
+    des2src(upaychkdtl.issueinst, string(upaychkfile.issueinst, sizeof(upaychkfile.issueinst)).c_str());
+    des2src(upaychkdtl.accno, string(upaychkfile.acctno, sizeof(upaychkfile.acctno)).c_str());
+    upaychkdtl.amount = str2int(string(upaychkfile.transamt, sizeof(upaychkfile.transamt)));
+    des2src(upaychkdtl.merchtype, string(upaychkfile.merchtype, sizeof(upaychkfile.merchtype)).c_str());
+    des2src(upaychkdtl.refno, string(upaychkfile.refno, sizeof(upaychkfile.refno)).c_str());
+    des2src(upaychkdtl.authcode, string(upaychkfile.authcode, sizeof(upaychkfile.authcode)).c_str());
+    des2src(upaychkdtl.termno, string(upaychkfile.termno, sizeof(upaychkfile.termno)).c_str());
+    des2src(upaychkdtl.merchno, string(upaychkfile.merchno, sizeof(upaychkfile.merchno)).c_str());
+    des2src(upaychkdtl.merchname, string(upaychkfile.merchname, sizeof(upaychkfile.merchname)).c_str());
+    upaychkdtl.merchdrfee = str2int(string(upaychkfile.merchdrfee, sizeof(upaychkfile.merchdrfee)));
+    upaychkdtl.merchcrfee = str2int(string(upaychkfile.merchcrfee, sizeof(upaychkfile.merchcrfee)));
+    des2src(upaychkdtl.transtatus, string(upaychkfile.transtatus, sizeof(upaychkfile.transtatus)).c_str());
+    upaychkdtl.checkstatus = 0;
+    db_getsysdatetime2(upaychkdtl.updtime);
+
+    ret = DB_t_upaychkdtl_add(&upaychkdtl);
+    if(ret)
+    {
+        return E_DB_ADD;
+    }
+    return 0;
+}
+int readchkfile2db(int fileid, const char* checkfilename)
+{
+    int ret = 0;
+    ifstream  infile;
+    infile.open(checkfilename, ios::in);
+    if(infile.fail())
+    {
+        LOG(ERROR, "open " << checkfilename << " failed");
+        return -1;
+    }
+    ST_UPAYCHKFILE  upaychkfile;
+    string line;
+    while(!infile.eof())
+    {
+        memset(&upaychkfile, 0, sizeof(upaychkfile));
+        std::getline(infile, line);
+        if(line.size() < sizeof(upaychkfile))
+        {
+            LOG(ERROR, "record length error");
+            infile.close();
+            return -2;
+        }
+        if(strncmp(line.c_str(), "0000000000", 10) == 0)
+            continue;
+        if(strncmp(line.c_str(), "9999999999", 10) == 0)
+        {
+            //读取累加值
+            memcpy(&upaychkfile, line.c_str(), sizeof(upaychkfile));
+            T_t_upaychkfile tUpayChkFile;
+            memset(&tUpayChkFile, 0, sizeof(tUpayChkFile));
+            ret = DB_t_upaychkfile_read_lock_by_c0_and_fileid(fileid, &tUpayChkFile);
+            if(ret)
+            {
+                infile.close();
+                LOG(ERROR, "DB_t_upaychkfile_read_by_fileid ret=" << ret << ",fileid=" << fileid);
+                db_rollback();
+                return ret;
+            }
+            tUpayChkFile.sumtransamt = str2int(string(upaychkfile.transamt, sizeof(upaychkfile.transamt)));
+            tUpayChkFile.summerchdrfee = str2int(string(upaychkfile.merchdrfee, sizeof(upaychkfile.merchdrfee)));
+            tUpayChkFile.summerchcrfee  = str2int(string(upaychkfile.merchcrfee, sizeof(upaychkfile.merchcrfee)));
+            tUpayChkFile.chkstatus = 1;
+            strcpy(tUpayChkFile.remark, "对账文件导入数据库成功");
+            db_getsysdatetime2(tUpayChkFile.updtime);
+            ret = DB_t_upaychkfile_update_lock_by_c0(&tUpayChkFile);
+            if(ret)
+            {
+                infile.close();
+                LOG(ERROR, "DB_t_upaychkfile_update_lock_by_c0 ret=" << ret << ",fileid=" << fileid);
+                db_rollback();
+                return ret;
+            }
+            break;
+        }
+        memcpy(&upaychkfile, line.c_str(), sizeof(upaychkfile));
+        ret = Insert2db(fileid, upaychkfile);
+        if(ret)
+        {
+            infile.close();
+            LOG(ERROR, "save to database error:ret=" << ret);
+            return ret;
+        }
+    }
+    infile.close();
+    LOG(INFO, checkfilename << " save to database OK");
+    return 0;
+}
+static int GeChkFileIDVect(vector<int>& fileList)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        int  ho_fileid = 0;
+        short ho_idr = 0;
+    EXEC SQL END DECLARE SECTION;
+    int ret = 0;
+    if(fileList.size())
+        fileList.clear();
+    SQLCODE = 0;
+    EXEC SQL DECLARE posfile_cur CURSOR FOR
+     SELECT fileid
+     FROM t_upaychkfile
+     where chkstatus<3;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_DECLARE;
+    }
+    EXEC SQL	OPEN posfile_cur;
+    if(SQLCODE)
+    {
+        CHECK_DB_ERR;
+        return E_DB_CURSOR_OPEN;
+    }
+    while(1)
+    {
+        ho_fileid = 0;
+        EXEC SQL FETCH posfile_cur INTO
+        :ho_fileid:ho_idr;
+        if(SQLCODE)
+        {
+            ret = SQLCODE;
+            CHECK_DB_ERR;
+            EXEC SQL CLOSE posfile_cur;
+            if(DB_NOTFOUND == ret)
+            {
+                break;
+            }
+            else
+                return ret;
+        }
+        fileList.push_back(ho_fileid);
+    }
+    return 0;
+}
+static bool init_config(string pathname, string& connectinfo, string& logconf)
+{
+    try
+    {
+        ConfigFile config(pathname);
+        try
+        {
+            config.readInto(connectinfo, "connectinfo");
+            config.readInto(logconf, "logconf");
+        }
+        catch(ConfigFile::key_not_found& ex)
+        {
+            cout << "read " << ex.key << " faild" << endl;
+            return false;
+        }
+        return true;
+    }
+    catch(ConfigFile::file_not_found& ex)
+    {
+        cout << "read file " << ex.filename << " faild " << endl;
+        return false;
+    }
+}
+static bool getdircfg(string pathname, string& chkfiledir, string& bakfiledir)
+{
+    try
+    {
+        ConfigFile config(pathname);
+        try
+        {
+            config.readInto(chkfiledir, "filedir");
+            config.readInto(bakfiledir, "bakdir");
+        }
+        catch(ConfigFile::key_not_found& ex)
+        {
+            cout << "read " << ex.key << " faild" << endl;
+            return false;
+        }
+        return true;
+    }
+    catch(ConfigFile::file_not_found& ex)
+    {
+        cout << "read file " << ex.filename << " faild " << endl;
+        return false;
+    }
+}
+int DoCheckFile(const char* filedir, const char* bakdir, const char* checkfile)
+{
+    int ret;
+    char fullfile[256];
+    sprintf(fullfile, "%s/%s", filedir, checkfile);
+    char bakfile[256];
+    sprintf(bakfile, "%s/%s", bakdir, checkfile);
+    int fileid = 0;
+    ret = InsertCheckFile(checkfile, fileid);
+    if(ret)
+    {
+        LOG(ERROR, "InsertCheckFile ret=" << ret << ",filename:" << checkfile);
+        if(E_COMMON_ERR == ret)
+            goto BACKUP;
+        else
+            return ret;
+    }
+    ret = readchkfile2db(fileid, fullfile);
+    if(ret)
+    {
+        LOG(ERROR, "readchkfile2db ret=" << ret << ",checkfile[" << checkfile << "]");
+        return ret;
+    }
+BACKUP:
+    ret = rename(fullfile, bakfile);
+    if(ret)
+    {
+        LOG(ERROR, "rename " << fullfile << " to " << bakfile << " failed ret=" << ret);
+        return ret;
+    }
+    return 0;
+}
+int ProcessCheckFile(const char* filedir, const char* bakdir)
+{
+    //处理已解密的响应文件
+    vector<string>  fileList;
+    ScanDir(filedir, fileList);
+    if(fileList.size() < 1)
+        return 0;
+    int ret = 0;
+    for(unsigned int i = 0; i < fileList.size(); i++)
+    {
+        ret = DoCheckFile(filedir, bakdir, fileList[i].c_str());
+        if(ret)
+        {
+            db_rollback();
+            continue;
+        }
+        ret = db_commit();
+        if(ret)
+            return ret;
+    }
+    return 0;
+}
+int StatCheckFile()
+{
+    vector<int> fileidList;
+    int ret = GeChkFileIDVect(fileidList);
+    if(ret)
+    {
+        LOG(ERROR, "GeChkFileIDVect ret=" << ret);
+        return ret;
+    }
+    if(fileidList.size() < 1)
+        return 0;
+    for(size_t i = 0; i < fileidList.size(); i++)
+    {
+        char	sqlcmd[256];
+        sprintf(sqlcmd, " begin  p_upaytermstat(%d); end;", fileidList[i]);
+        ret = dynamic_execute_sql(sqlcmd, NULL);
+        if(ret)
+        {
+            LOG(ERROR, "dynamic_execute_sql ret=" << ret);
+            return ret;
+        }
+    }
+    return 0;
+}
+
+int  main(int argc, char *argv[])
+{
+
+    int ret = 0;
+    char  szVerNo[61] = {0};
+    sprintf(szVerNo, "%s %s (%s %s)", argv[0], YKT_VERSION, __DATE__, __TIME__);
+
+    string conf = argv[0];
+    conf = conf + ".conf";
+
+    string connectinfo;
+    string logconf;
+    if(!init_config(conf, connectinfo, logconf))
+    {
+        cout << "init_config failed!";
+        return -1;
+    }
+    if(!init_logger(logconf))
+    {
+        cout << "server init log faild" << endl;
+        return -2;
+    }
+    string filedir;
+    string bakdir;
+    if(!getdircfg(conf, filedir, bakdir))
+    {
+        cout << "read dir config  failed!";
+        return -3;
+    }
+    LOG(DEBUG, "init ok begin to work");
+    int isConnected = 0;
+    while(1)
+    {
+        isConnected = CheckDbConnected();
+        if(!isConnected)
+        {
+            ret = ConnectDb(connectinfo.c_str());
+            if(ret)
+            {
+                LOG(ERROR, "连接数据库失败");
+                sleep(5);
+                continue;
+            }
+        }
+        ProcessCheckFile(filedir.c_str(), bakdir.c_str());
+        StatCheckFile();
+        sleep(10);
+    }
+    db_disconnect();
+    LOG(DEBUG, "exit");
+    return 0;
+}
+

@@ -1,0 +1,37 @@
+create table t_upaychkdtl
+(
+  settledate number,
+  fileid number,
+  transcode varchar2(3),
+  upayseqno number,
+  termdate varchar2(8),
+  termtime varchar2(6),
+  acceptinst varchar2(11),
+  fwdinst varchar2(11),
+  issueinst varchar2(11),
+  accno varchar2(19),
+  amount number,
+  merchtype varchar2(6),
+  refno varchar2(12),
+  authcode varchar2(6),
+  termno varchar2(8),
+  merchno varchar2(15),
+  merchname varchar2(60),
+  merchdrfee number,
+  merchcrfee number,
+  transtatus varchar2(5),
+  checkstatus number,
+  updtime varchar2(14),
+  remark varchar2(240)
+)
+begin
+action modename gzupay end
+action add end
+action read_by settledate fileid upayseqno end
+action update_by settledate fileid upayseqno end
+action del_by settledate fileid upayseqno end
+action read_lock_by c0 settledate fileid upayseqno end
+action update_lock_by c0 end
+action del_lock_by c0 end
+action free_lock_by c0 end
+end

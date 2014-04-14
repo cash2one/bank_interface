@@ -1,0 +1,33 @@
+create table t_upayposdata
+(
+  posdataid number,
+  datalen number,
+  posdata varchar2(1000),
+  status number,
+  termdate varchar2(8),
+  termtime varchar2(6),
+  merchno varchar2(15),
+  termno varchar2(8),
+  termseqno number,
+  termbatchno number,
+  cardno varchar2(19),
+  cardcnt number,
+  amount number,
+  vmerchno varchar2(15),
+  vtermno varchar2(8),
+  filedata varchar2(600),
+  crttime varchar2(14),
+  updtime varchar2(14),
+  remark varchar2(240)
+)
+begin
+action modename gzupay end
+action add end
+action read_by posdataid end
+action update_by posdataid end
+action del_by posdataid end
+action read_lock_by c0 posdataid end
+action update_lock_by c0 end
+action del_lock_by c0 end
+action free_lock_by c0 end
+end

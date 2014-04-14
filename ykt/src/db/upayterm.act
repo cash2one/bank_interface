@@ -1,0 +1,24 @@
+create table t_upayterm
+(
+  termid number,
+  merchid number,
+  termno varchar2(20),
+  termname varchar2(60),
+  status number,
+  regdate varchar2(8),
+  deldate varchar2(8),
+  updtime varchar2(14),
+  remark varchar2(60)
+)
+begin
+action modename gzupay end
+action add end
+action read_by termid end
+action read_by termno end
+action update_by termid end
+action del_by termid end
+action read_lock_by c0 termid end
+action update_lock_by c0 end
+action del_lock_by c0 end
+action free_lock_by c0 end
+end

@@ -1,0 +1,15 @@
+create table t_operseqno
+(
+  operid	 integer;
+  operseqno integer,
+  checknum integer,
+  updtime number(14)
+)
+begin
+action modename ykt_cur end
+action add end
+action read_by operid  end
+action read_lock_by c0 operid end
+action update_lock_by c0 end
+action free_lock_by c0 end
+end

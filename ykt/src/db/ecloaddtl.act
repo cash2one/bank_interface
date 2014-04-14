@@ -1,0 +1,44 @@
+create table t_ecloaddtl
+(
+accdate varchar(8),
+refno   varchar(20),
+acctime varchar(6),
+termid  integer,
+termseqno integer,
+transdate varchar(8),
+transtime varchar(6),
+cardno    integer,
+custid    integer,
+cardphyid  varchar(16),
+stuempno  varchar(20),
+custname  varchar(20),
+amount    integer,     
+ecbalance integer,
+drbankcardno varchar(20), 
+crbankcardno varchar(20), 
+drbankcode varchar(2),
+crbankcode varchar(2),
+status    number(1),  
+revflag   number(1), 
+writecardflag number(1),
+drchkflag number(1),
+drchktime varchar(14),
+drrefno   varchar(30),
+crchkflag number(1),
+crchktime varchar(14),
+crrefno  varchar(30),
+paystatus number(1),
+payrefno varchar(20),
+paymac   varchar(8),
+errcode integer,
+errmsg  varchar(256),
+field55 varchar(1000),
+usemargin number(1))
+action modename ykt_cur end
+action add end
+action read_by accdate refno end
+action update_by accdate refno end
+action read_lock_by cur accdate refno end
+action update_lock_by cur end
+action free_lock_by cur end
+end

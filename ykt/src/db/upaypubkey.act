@@ -1,0 +1,13 @@
+create table t_upaypubkey
+(
+  keyid number,
+  rid varchar2(10),
+  keyindex varchar2(2),
+  content varchar2(800)
+)
+begin
+action modename gzupay end
+action add end
+action read_by keyid end
+action read_by rid keyindex end
+end

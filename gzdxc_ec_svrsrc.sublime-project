@@ -1,0 +1,17 @@
+{
+    "folders":
+    [
+        {
+            "path" : "./ykt",
+            "folder_exclude_patterns" : ["build", ".idea", ".settings"]
+        }
+    ],
+    "settings":
+    {
+        "sftp_hostname":"192.168.1.200",
+        "sftp_user":"yktupay",
+        "sftp_password":"kingstar",
+        "sftp_remote_basedir":"/home/yktupay/ykt",
+        "sftp_timeout": 1.0
+    }
+}

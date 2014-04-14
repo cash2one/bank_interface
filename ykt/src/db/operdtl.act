@@ -1,0 +1,27 @@
+create table t_operdtl
+(
+  id number,
+  hostdate varchar2(8),
+  hosttime varchar2(6),
+  operid number,
+  operseqno number,
+  refno number(20),
+  transcode number,
+  termid number,
+  termdate varchar2(8),
+  termtime varchar2(6),
+  chkoperid number,
+  status number,
+  transinfo varchar2(480),
+  reqdata varchar2(1000)
+)
+begin
+action modename ykt_cur end
+action add end
+action read_by operid operseqno end
+action del_by id end
+action read_lock_by c0 id end
+action update_lock_by c0 end
+action del_lock_by c0 end
+action free_lock_by c0 end
+end

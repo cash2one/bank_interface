@@ -1,0 +1,39 @@
+create table t_dpsmac
+(
+   refno varchar2(20),
+  accdate varchar(8),
+  termid number,
+  termseqno number,
+  transcode number(4),
+  cardasno varchar2(20),
+  cardno number(9),
+  dpscnt number,
+  paycnt number,
+  cardbefbal number,
+  amount number,
+  dpsamt number,
+  cardaftbal number,
+  hostdate varchar(8),
+  hosttime varchar(6),
+  samno varchar2(12),
+  randnum varchar2(8),
+  mac1 varchar2(8),
+  mac2 varchar2(8),
+  tac	   varchar2(8),
+  confirmed number,
+  isok number,
+  isbreak number,
+  updtime varchar2(14)
+)
+begin
+action modename ykt_cur end
+action add end
+action read_by refno end
+action read_by accdate refno end
+action update_by accdate refno end
+action del_by accdate refno end
+action read_lock_by c0 accdate refno end
+action update_lock_by c0 end
+action del_lock_by c0 end
+action free_lock_by c0 end
+end

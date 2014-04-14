@@ -1,0 +1,31 @@
+create table t_refno
+(
+  refno varchar(20),
+  mac varchar2(8),
+  accdate varchar(8),
+  reqrefno number(20),
+  transcode number,
+  fundtype number,
+  amount number,
+  operid number,
+  termid number,
+  termseqno number,
+  custid number,
+  cardno number,
+  status number,
+  lastsaved varchar(14)
+)
+begin
+action modename ykt_cur end
+action add end
+action read_by refno end
+action update_by refno end
+action del_by refno end
+action read_lock_by c0 refno end
+action update_lock_by c0 end
+action free_lock_by c0 end
+action open_select_by c1 status end
+action fetch_select_by c1 end
+action close_select_by c1 end
+action read_by reqrefno accdate end
+end

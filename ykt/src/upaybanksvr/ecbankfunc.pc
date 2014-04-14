@@ -1,0 +1,1601 @@
+/**
+(c) Copyright 2013 Supwisdom Tech. All Rights Reserved.
+*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <sstream>
+#include <cassert>
+#include <errno.h>
+#include <iomanip>
+#include <stdexcept>
+#include "errdef.h"
+#include "unitfunc.h"
+#include "upaybanksvr.h"
+#include "md5.h"
+#include "tcp.h"
+#include "ecbankfunc.h"
+#include "cpack.h"
+#include "bupub.h"
+#include "bufunc.h"
+#include "gnudes.h"
+
+using namespace std;
+EXEC SQL INCLUDE SQLCA;
+
+extern CSvrLink* g_pSvrLink;  // 与业务调度中心的连接
+
+
+std::string encode_hex(unsigned char* data, size_t datalen)
+{
+    std::stringstream ss;
+    for(size_t i = 0; i < datalen; ++i)
+    {
+        ss << HEX_BYTE_FMT << (size_t)data[i];
+    }
+    return ss.str();
+}
+std::string encode_hex(const std::string& data)
+{
+    return encode_hex((unsigned char*)data.c_str(), data.size());
+}
+/** \brief HEX格式解码
+
+  \author 汤 成
+  \date 2013-05-16
+  \param  data - 传入数据
+  \param  hex- 解码后的数据
+  \return 解码后的数据长度
+**/
+std::size_t decode_hex(const std::string& data, unsigned char* hex)
+{
+    size_t offset = 0;
+    assert(data.length() % 2 == 0);
+    for(offset = 0; offset < data.length(); offset += 2)
+    {
+        istringstream ss(data.substr(offset, 2));
+        size_t t;
+        ss >> std::hex >> t;
+        hex[offset / 2] = (unsigned char)t;
+    }
+    return offset / 2;
+}
+std::string decode_hex(const std::string& data)
+{
+    size_t offset = 0;
+    assert(data.length() % 2 == 0);
+    string result;
+    for(offset = 0; offset < data.length(); offset += 2)
+    {
+        istringstream ss(data.substr(offset, 2));
+        size_t t;
+        ss >> std::hex >> t;
+        result.append(1, (char)(t & 0xFF));
+    }
+    return result;
+}
+void ec_x9_19_mac_hex(const std::string& key_hex, const std::string& data_hex,
+                      std::string& mac_hex)
+{
+    string key, data, mac;
+    key = decode_hex(key_hex);
+    data = decode_hex(data_hex);
+    ec_x9_19_mac(key, data, mac);
+    mac_hex = encode_hex(mac);
+}
+void ec_x9_19_mac(const std::string& key, const std::string& data,
+                  std::string& mac)
+{
+    unsigned char init_data[8], result_data[8];
+    static const size_t pad_size = 8;
+    des_context k1, k2;
+    unsigned char * key_ptr = (unsigned char*)key.c_str();
+    memset(init_data, 0, sizeof init_data);
+    for(size_t offset = 0; offset < data.size(); offset += pad_size)
+    {
+        size_t pos;
+        for(pos = 0;
+            pos < pad_size && pos + offset < data.size();
+            ++pos)
+        {
+            init_data[pos] ^= data[offset + pos];
+        }
+        for(; pos < pad_size; ++pos)
+        {
+            init_data[pos] ^= 0x00;
+        }
+
+        memset(&k1, 0, sizeof k1);
+        des_set_key(&k1, key_ptr);
+        des_encrypt(&k1, init_data, result_data);
+        memcpy(init_data, result_data, pad_size);
+
+    }
+    memset(&k2, 0, sizeof k2);
+    des_set_key(&k2, key_ptr + 8);
+    des_decrypt(&k2, init_data, result_data);
+
+    memset(&k1, 0, sizeof k1);
+    des_set_key(&k1, key_ptr);
+    des_encrypt(&k1, result_data, init_data);
+    mac = string((char*)init_data, 8);
+}
+/** \brief get bank code from bank card no
+
+  \author 汤 成
+  \date 2013-05-17
+  \param bankcardno - bank card no
+  \param bankcode bank code
+  \return 0 - success otherwise error
+**/
+int get_bankcode_from_bankcardno(const char* bankcardno, T_t_bankcardheader* bankcode)
+{
+    int ret;
+    T_t_bankcardheader bankcardheader;
+    ret = DB_t_bankcardheader_open_select_by_c1();
+    if(ret)
+    {
+        LOG(ERROR, "DB_t_bankcardheader_open_select_by_c1 error,ret=" << ret);
+        if(DB_NOTFOUND == ret)
+            return E_DB_BANK_N;
+        return E_DB_BANK_R;
+    }
+    //LOG(DEBUG,"check bankcard["<<bankcardno<<"]");
+    while(1)
+    {
+        memset(&bankcardheader, 0, sizeof bankcardheader);
+        ret = DB_t_bankcardheader_fetch_select_by_c1(&bankcardheader);
+        if(ret)
+        {
+            LOG(ERROR, "DB_t_bankcardheader_fetch_select_by_c1 error,ret=" << ret);
+            if(DB_NOTFOUND == ret)
+            {
+                return E_DB_BANK_N;
+            }
+            return E_DB_BANK_R;
+        }
+        size_t l = strlen(bankcardheader.cardheader);
+        LOG(ERROR, "bankcard[" << bankcardno << "]header["
+            << bankcardheader.cardheader << "]");
+        if(strncmp(bankcardno, bankcardheader.cardheader, l) == 0)
+        {
+            DB_t_bankcardheader_close_select_by_c1();
+            memcpy(bankcode, &bankcardheader, sizeof(T_t_bankcardheader));
+            return 0;
+        }
+    }
+    LOG(ERROR, "not found");
+    return E_DB_BANK_N;
+}
+
+int get_ec_para(int paraid, std::string& paraval)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        sqlint32 hi_paraid = 0;
+        char ho_paraval[501] = {0};
+        sqlint16 indr = 0;
+    EXEC SQL END DECLARE SECTION;
+
+    hi_paraid = paraid;
+    memset(ho_paraval, 0, sizeof ho_paraval);
+
+    EXEC SQL select paraval into :
+    ho_paraval:
+        indr
+    from t_ecpara where paraid = :
+                                     hi_paraid;
+
+    if(SQLCODE)
+    {
+        if(DB_NOTFOUND == SQLCODE)
+        {
+            return E_DB_SYSPARA_N;
+        }
+        return E_DB_SYSPARA_R;
+    }
+    trim(ho_paraval);
+    paraval = ho_paraval;
+    return 0;
+}
+
+int get_ec_para(int paraid, int& paraval)
+{
+    int ret;
+    string val;
+    ret = get_ec_para(paraid, val);
+    if(ret)
+    {
+        return ret;
+    }
+    istringstream e(val);
+    int v = 0;
+    e >> v;
+    paraval = v;
+    return 0;
+}
+
+bool ec_xml_get_xml_value(TiXmlNode& root, const std::string& node_name,
+                          std::string& node_value)
+{
+    node_value = "";
+    TiXmlHandle root_handle(&root);
+    TiXmlHandle element = root_handle.Child(node_name.c_str(), 0);
+    TiXmlHandle text = element.FirstChild();
+    if(!text.ToText())
+        return false;
+    node_value = text.ToText()->Value();
+    return true;
+}
+
+bool ec_add_xml_node_value(TiXmlNode& root, const std::string& node_name, const
+                           std::string& node_value)
+{
+    TiXmlElement n(node_name.c_str());
+    TiXmlNode* child = root.InsertEndChild(n);
+    if(!child)
+        return false;
+
+    TiXmlText text(node_value.c_str());
+    child->InsertEndChild(text);
+    return true;
+}
+bool ec_add_xml_node_value(TiXmlNode& root, const std::string& node_name,
+                           int node_value)
+{
+    stringstream ss;
+    ss << node_value;
+    return ec_add_xml_node_value(root, node_name, ss.str());
+}
+
+bool ec_xml_get_xml_childnode(TiXmlNode& root, const std::string& node_name,
+                              TiXmlNode** child)
+{
+    TiXmlHandle root_handle(&root);
+    TiXmlHandle element = root_handle.Child(node_name.c_str(), 0);
+    TiXmlNode* node = element.Node();
+    if(!node)
+        return false;
+    *child = node;
+    return true;
+}
+////////////////////////////////////////////////////////////////////////
+int ec_update_account(T_t_ecloaddtl* dtl, T_t_ecaccount* account)
+{
+    /*
+        char    ecbankno[20+1];
+        int status;
+        int ecbala;
+        char    updbaladate[8+1];
+        char    updbalatime[6+1];
+        int consumeamt;
+        char    consumeupddate[8+1];
+        char    consumeupdtime[6+1];
+        int loadtotalamt;
+        int consumetotalamt;
+        char    bankcode[2+1];
+    */
+    int ret;
+    ret = DB_t_ecaccount_read_lock_by_cur_and_custid_and_ecbankno(
+              dtl->custid, dtl->crbankcardno, account);
+    if(ret)
+    {
+        if(DB_NOTFOUND == ret)
+        {
+            // add
+            account->custid = dtl->custid;
+            des2src(account->custname, dtl->custname);
+            account->cardno = dtl->cardno;
+            des2src(account->ecbankno, dtl->crbankcardno);
+            account->status = 1;
+            des2src(account->bankcode, dtl->crbankcode);
+            account->ecbala = dtl->ecbalance + dtl->amount;
+            des2src(account->updbaladate, dtl->transdate);
+            des2src(account->updbalatime, dtl->transtime);
+            account->loadtotalamt = dtl->amount;
+            ret = DB_t_ecaccount_add(account);
+            if(ret)
+            {
+                return E_DB_ECACCOUNT_I;
+            }
+        }
+        else
+        {
+            return E_DB_ECACCOUNT_R;
+        }
+    }
+    else
+    {
+        account->ecbala = dtl->ecbalance + dtl->amount;
+        des2src(account->updbaladate, dtl->transdate);
+        des2src(account->updbalatime, dtl->transtime);
+        account->loadtotalamt += dtl->amount;
+        ret = DB_t_ecaccount_update_lock_by_cur(account);
+        if(ret)
+        {
+            return E_DB_ECACCOUNT_U;
+        }
+    }
+    return 0;
+}
+int ec_update_marginacc(T_t_ecloaddtl* dtl)
+{
+    int ret;
+    T_t_ecmarginaccount marginacc;
+    memset(&marginacc, 0, sizeof marginacc);
+    ret = DB_t_ecmarginaccount_read_lock_by_cur_and_bankcode(dtl->crbankcode, &marginacc);
+    if(ret)
+    {
+        if(DB_NOTFOUND == ret)
+        {
+            return E_DB_ECMARGINACCOUNT_N;
+        }
+        return E_DB_ECMARGINACCOUNT_R;
+    }
+    marginacc.balance -= dtl->amount;
+    des2src(marginacc.lastupdtime, dtl->transdate);
+    strcat(marginacc.lastupdtime, dtl->transtime);
+    ret = DB_t_ecmarginaccount_update_lock_by_cur(&marginacc);
+    if(ret)
+    {
+        return E_DB_ECMARGINACCOUNT_U;
+    }
+    return 0;
+}
+////////////////////////////////////////////////////////////////////////
+// ec_bank_transfer
+
+//#define EC_BANKCOMM_MECHID "441001"
+
+ec_bank_trans_param::ec_bank_trans_param()
+{
+}
+ec_bank_trans_param::~ec_bank_trans_param()
+{
+    clear();
+}
+
+bool ec_bank_trans_param::has_value(const std::string& key) const
+{
+    value_type::const_iterator i = values_.find(key);
+    return (i != values_.end());
+}
+std::string ec_bank_trans_param::get(const std::string& key) const
+{
+    value_type::const_iterator i = values_.find(key);
+    if(i == values_.end());
+    throw runtime_error("no such parameter");
+    return i->second;
+}
+bool ec_bank_trans_param::set(const std::string& key, const std::string& value)
+{
+    values_[key] = value;
+    return true;
+}
+bool ec_bank_trans_param::set(const std::string& key, int value)
+{
+    stringstream ss;
+    ss << value;
+    return set(key, ss.str());
+}
+std::string& ec_bank_trans_param::operator[](const std::string& key)
+{
+    return values_[key];
+}
+
+const std::string ec_bank_trans_param::operator[](const std::string& key) const
+{
+    value_type::const_iterator iter = values_.find(key);
+    if(iter == values_.end())
+        throw runtime_error("no such param");
+
+    string temp = iter->second;
+    return temp;
+}
+
+bool ec_bank_trans_param::remove(const std::string& key)
+{
+    if(!has_value(key))
+        return false;
+    value_type::iterator i = values_.find(key);
+    values_.erase(i);
+    return true;
+}
+void ec_bank_trans_param::clear()
+{
+    values_.clear();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+ec_bank_trans_load* ec_bank_trans_load::s_instance_ = NULL;
+ec_bank_trans* ec_bank_trans_load::get_transfer(const std::string& from_bank,
+                                                const std::string& to_bank)
+{
+    string type_id = from_bank + to_bank;
+    LOG(DEBUG, "查找圈存配置，[" << type_id << "]");
+    trans_define_map::iterator iter = define_map_.find(type_id);
+    if(iter == define_map_.end())
+    {
+        type_id = BANK_ANY_CODE;
+        type_id += to_bank;
+        //LOG(DEBUG,"查找圈存配置，["<<type_id<<"]");
+        iter = define_map_.find(type_id);
+        if(iter == define_map_.end())
+            return NULL;
+    }
+    return iter->second;
+}
+
+bool ec_bank_trans_load::register_transfer(const std::string& from_bank,
+                                           const std::string& to_bank,  ec_bank_trans* trans)
+{
+    string type_id = from_bank + to_bank;
+    //std::cout<<"注册电子现金圈存配置，["<<type_id<<"]"<<std::endl;
+    if(define_map_.count(type_id) > 0)
+        return false;
+    define_map_[type_id] = trans;
+
+    return true;
+}
+ec_bank_trans_load* ec_bank_trans_load::instance()
+{
+    if(!ec_bank_trans_load::s_instance_)
+    {
+        ec_bank_trans_load::s_instance_ = new ec_bank_trans_load;
+    }
+    return ec_bank_trans_load::s_instance_;
+}
+void ec_bank_trans_load::free()
+{
+    if(ec_bank_trans_load::s_instance_)
+    {
+        delete ec_bank_trans_load::s_instance_;
+        ec_bank_trans_load::s_instance_ = NULL;
+    }
+}
+
+ec_bank_trans_load::~ec_bank_trans_load()
+{
+    for(trans_define_map::iterator iter = define_map_.begin();
+        iter != define_map_.end(); ++iter)
+    {
+        ec_bank_trans* trans = iter->second;
+        if(trans)
+        {
+            delete trans;
+        }
+    }
+    define_map_.clear();
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+ec_bank_trans::ec_bank_trans(): debug_(false), use_margin_acc_(true), need_payment_(true)
+{
+    // empty
+}
+ec_bank_trans::~ec_bank_trans()
+{
+    // empty
+}
+size_t ec_bank_trans::get_buffer_as_int(const char* buffer, std::size_t len)
+{
+    std::string temp(buffer, len);
+    return atoi(temp.c_str());
+}
+void ec_bank_trans::get_buffer_as_str(const char* buffer, std::size_t len, char* out)
+{
+    std::string temp(buffer, len);
+    size_t p = temp.length();
+    while(p > 0)
+    {
+        if(temp[p - 1] != ' ')
+            break;
+    }
+    strncpy(out, temp.c_str(), p);
+    return;
+}
+
+struct SockNode
+{
+    CTcpSocket  hSock;
+    char        Buf[1024];
+    int     HaveRead;
+    int     TotalRead;
+};
+
+int ec_bank_trans::send_to_and_recv_from_bank(const ST_BANK_CONFIG* config,
+                                              const char* pSend, size_t send_len, char* pRecv, size_t recv_len)
+{
+    struct SockNode  SockNode;
+    char bank_ip[20] = "";
+    int bank_port = 0;
+    int ret = 0;
+    int delay_time = 5000;
+
+    des2src(bank_ip, config->bank_ip);
+    bank_port = config->bank_port;
+    delay_time = config->delay_time;
+    //启用signal，防止阻塞模式的socket
+
+    alarm(delay_time / 1000);
+    //连接银行
+    ret = SockNode.hSock.ConnectTcp(bank_ip, bank_port);
+    if(!ret)
+    {
+        alarm(0);
+        LOG(ERROR, "Connect to bank error,error code is [" << ret
+            << "],bank_ip[" << bank_ip << "],port[" << bank_port << "] ");
+        return r_conn;
+    }
+    alarm(0);
+
+
+    //发送数据到银行
+    ret = SockNode.hSock.Send((char*)pSend, (int)send_len);
+    if(ret < 0)
+    {
+        // 发送时，端口有问题，包括被关闭
+        LOG(ERROR, "Send to bank error,ret = [" << ret << "] ");
+        return r_send;
+    }
+    else if(0 == ret)
+    {
+        // 不应该出现这种情况
+        LOG(ERROR, "Send to bank error,CTcpSocket.Send should not return this error,error code is[" << errno << "]!");
+        return  r_send;
+    }
+
+    //接收银行返回信息
+    ret =   SockNode.hSock.Recv(pRecv, (int)recv_len, delay_time);
+    if(ret <= 0)
+    {
+        LOG(ERROR, "Receive from bank error,ret= [" << ret << "] ");
+        return  r_recv;  // 接收时候出错，或超时
+    }
+    SockNode.hSock.Close();
+    return r_ok;
+}
+
+int ec_bank_trans::send_to_anybank_ykt(T_t_ecloaddtl& ecloaddtl,
+                                       const ec_bank_trans_param& para)
+{
+    // 发送请求到圈存前置机进行圈存交易
+    ST_CPACK rCPack, aCPack;
+    ST_PACK* rPack = &(rCPack.pack);
+
+    ResetNormalCPack(&rCPack, 0, 1);
+    rCPack.head.RequestType = 900077;
+    SetHeadCol(&rCPack, F_SCLOSE_EMP, F_SDATE0, F_STIME0, F_SORDER2,
+               F_SCUST_AUTH, F_SSTATION0, F_SSERIAL0, F_SSERIAL1, F_LVOL1,
+               F_SORDER0, F_SEMP_PWD, 0);
+
+    des2src(rPack->sclose_emp, "240001");
+    des2src(rPack->sdate0, ecloaddtl.transdate);
+    des2src(rPack->stime0, ecloaddtl.transtime);
+    sprintf(rPack->sorder2, "%d", ecloaddtl.termid);
+    des2src(rPack->scust_auth, ecloaddtl.drbankcardno);
+    des2src(rPack->sserial1, "0");
+    sprintf(rPack->sserial0, "%d", ecloaddtl.cardno);
+    rPack->lvol1 = 1;
+    sprintf(rPack->sorder0, "%d", ecloaddtl.amount);   // % 10000000000);
+    sprintf(rPack->semp_pwd, para["cardpwd"].c_str());
+
+    // 获取配置参数
+    int ret;
+    int ecard_branch, ecard_mainfunc;
+    ret = get_ec_para(ECARD_QC_SVR_BRANCH, ecard_branch);
+    if(ret)
+    {
+        LOG(ERROR, "未配置一卡通圈存前置机节点号[" << ECARD_QC_SVR_BRANCH << "]");
+        return r_error;
+    }
+    ret = get_ec_para(ECARD_QC_SVR_MAINFUNC, ecard_mainfunc);
+    if(ret)
+    {
+        LOG(ERROR, "未配置一卡通圈存前置机主功能号[" << ECARD_QC_SVR_MAINFUNC << "]");
+        return r_error;
+    }
+
+    ST_PACK ArrayPack;
+    memset(&ArrayPack, 0, sizeof ArrayPack);
+    // 超时 45s
+    LOG(DEBUG, "向一卡通圈存系统请求branch[" << ecard_branch
+        << "]basefunc[" << ecard_mainfunc << "]");
+    ret = ExtCall(0, ecard_branch, ecard_mainfunc, 0, 45, &rCPack, &aCPack, &ArrayPack);
+    // 重置 ParmBits
+    memset(&rCPack, 0, sizeof rCPack);
+    g_pSvrLink->SetCol(0, rCPack.head.ParmBits);
+
+    if(ret < 0)
+    {
+        LOG(ERROR, "向一卡通圈存请求，ret=" << ret << ",retcode=" << aCPack.head.retCode
+            << ",msg=" << aCPack.pack.vsmess);
+        des2src(ecloaddtl.errmsg, aCPack.pack.vsmess);
+        if(-2 == ret)
+        {
+            LOG(DEBUG, "向一卡通圈存系统请求超时");
+            return r_recv; // 请求超时
+        }
+        else
+        {
+            LOG(DEBUG, "向一卡通圈存系统请求失败");
+            return r_send;
+        }
+    }
+    if(aCPack.head.retCode !=  0)
+    {
+        LOG(ERROR, "向一卡通圈存系统请求错误，ret=" << aCPack.head.retCode
+            << ",msg=" << aCPack.pack.vsmess);
+        des2src(ecloaddtl.errmsg, aCPack.pack.vsmess);
+        return r_error;
+    }
+    LOG(DEBUG, "向一卡通圈存系统请求成功，serialno[" << aCPack.pack.lvol1);
+
+    sprintf(ecloaddtl.drrefno, "%d", aCPack.pack.lvol1);
+    return r_ok;
+}
+
+///////////////////////////////////////////////////////////////////////
+// ec_bank_icbc_bocomm : 任何银行 to  交行
+EC_REGISTER_TRANS(BANK_ANY_CODE, BANKCOMM_CODE, ec_bank_any_bocomm);
+
+
+ec_bank_any_bocomm::ec_bank_any_bocomm()
+{
+    need_payment_ = true;
+    use_margin_acc_ = true;
+}
+ec_bank_any_bocomm::~ec_bank_any_bocomm()
+{
+}
+int ec_bank_any_bocomm::transfer(T_t_ecloaddtl& ecloaddtl,
+                                 const ec_bank_trans_param& para)
+{
+    // a. 发送转账请求给工行
+    int ret;
+    ecloaddtl.usemargin = MARGIN_INIT;
+    LOG(DEBUG, "交行电子现金圈存，等待向一卡通圈存系统请求...");
+    ret = send_to_anybank_ykt(ecloaddtl , para);
+    if(ret)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        ERRTIP("下账失败");
+        return ret;
+    }
+    LOG(DEBUG, "交行电子现金圈存，等待向交行请求...");
+    //sprintf( ecloaddtl.drrefno, "%08d", 1 );
+    // b. 发送圈存请求给交行
+    ret = send_to_bocomm(ecloaddtl, "404102");
+    if(ret)
+    {
+        if(ret == r_recv)
+            ecloaddtl.usemargin = MARGIN_UNCONFIRMED;
+        else
+            ecloaddtl.usemargin = MARGIN_NOUSE;
+        ERRTIP("往交行充值失败");
+        return r_error;
+    }
+    ecloaddtl.usemargin = MARGIN_USED;
+    return r_ok;
+}
+int ec_bank_any_bocomm::post_transfer(T_t_ecloaddtl& ecloaddtl,
+                                      const ec_bank_trans_param& para,
+                                      int write_card)
+{
+	if(wc_success==write_card)
+    return 0;
+	int ret = send_to_bocomm(ecloaddtl, "404402");
+    if(ret)
+    {
+        ERRTIP("往交行冲正失败");
+        return r_error;
+    }
+    return r_ok;
+	
+}
+
+
+int ec_bank_any_bocomm::send_to_bocomm(T_t_ecloaddtl& ecloaddtl, const char* transcode)
+{
+    char header[90] = {0};
+    //char transcode[] = "404102";
+    char body[1024] = {0};
+    std::size_t header_len = 0;
+    std::size_t body_len = 0;
+    int timeout = 0;
+    std::stringstream ss;
+	int ret;
+
+    ret = get_ec_para(JHEC_TIMEOUT, timeout);
+    if(ret)
+    {
+        LOG(ERROR, "交行超时时限未配置");
+        return E_COMMON_ERR;
+    }
+
+    timeout *= 1000;
+
+    body_len = pack_body(ecloaddtl, body, transcode);
+    header_len = pack_header(ecloaddtl, header, transcode, body, body_len);
+    char length_of_req[7];
+    sprintf(length_of_req, "%06d", (header_len + body_len) % 1000000);
+
+    ss << length_of_req << header << body;
+
+
+    string jh_ip;
+    int jh_port;
+    //int ret;
+
+    ret = get_ec_para(JHEC_SVRIP, jh_ip);
+    if(ret)
+    {
+        LOG(ERROR, "交行前置机未配置");
+        return r_conn;
+    }
+    ret = get_ec_para(JHEC_SVRPORT, jh_port);
+    if(ret)
+    {
+        LOG(ERROR, "交行前置机未配置");
+        return r_conn;
+    }
+    LOG(DEBUG, "交行服务器[" << jh_ip << ":" << jh_port << "]");
+    CTcpSocket sock;
+    alarm(timeout / 1000);
+    if(!sock.ConnectTcp((char*)jh_ip.c_str(), jh_port))
+    {
+        alarm(0);
+        strcpy(ecloaddtl.errmsg, "连接交行服务器失败");
+        LOG(ERROR, "connect to bank_of_comm error");
+        return r_conn;
+    }
+    alarm(0);
+    LOG(DEBUG, "连接交行前置机成功，等待发送请求...");
+    if(sock.Send((char*)ss.str().c_str(), ss.str().length()) < (int)ss.str().length())
+    {
+        strcpy(ecloaddtl.errmsg, "发送数据到交行服务器失败");
+        LOG(ERROR, "Send to bank_of_comm error");
+        return r_send;
+    }
+
+    // 接收包头长度
+    char length_of_resp[7] = {0};
+    if(sock.Recv(length_of_resp, 6, timeout) < 6)
+    {
+        strcpy(ecloaddtl.errmsg, "接收交行服务器数据失败");
+        LOG(ERROR, "Recv from bank_of_comm error");
+        return r_recv;
+    }
+
+    length_of_req[6] = 0;
+    size_t total_len = atoi(length_of_resp);
+
+    char resp_header[83] = {0};
+    size_t resp_header_len = 82;
+
+    if(total_len <= resp_header_len)
+    {
+        strcpy(ecloaddtl.errmsg, "接收交行数据包长度不合法");
+        return r_recv;
+    }
+    LOG(DEBUG, "接收到交行电子现金应答...data[" << total_len << "]");
+    char data[8196] = {0};
+    if((ret = sock.Recv(data, total_len, timeout)) < (int) total_len)
+    {
+        strcpy(ecloaddtl.errmsg, "接收交行服务器数据失败");
+        LOG(ERROR, "Recv from bank_of_comm error,ret=" << ret);
+        return r_recv;
+    }
+    memcpy(resp_header, data, resp_header_len);
+    char resp_body[1024];
+    size_t resp_body_len = total_len - resp_header_len;
+    memcpy(resp_body, data + resp_header_len, resp_body_len);
+
+    /*
+    if( sock.Recv( resp_header, resp_header_len, timeout ) < ( int )resp_header_len )
+    {
+        strcpy( ecloaddtl.errmsg, "接收交行服务器数据失败" );
+        LOG( ERROR, "Recv from bank_of_comm error" );
+        return r_recv;
+    }
+    resp_header[resp_header_len] = 0;
+
+    char resp_body[1024];
+    size_t resp_body_len = total_len - resp_header_len;
+    if( resp_body_len > sizeof( resp_body ) )
+    {
+        LOG( ERROR, "resp length overflow" );
+        strcpy( ecloaddtl.errmsg, "接收数据长度异常" );
+        return r_recv;
+    }
+    memset( resp_body, 0, sizeof resp_body );
+    if( (ret = sock.Recv( resp_body, resp_body_len, timeout)) < ( int )resp_body_len )
+    {
+        strcpy( ecloaddtl.errmsg, "接收交行服务器数据失败");
+        LOG( ERROR, "Recv to bank_of_comm error,ret = "<<ret );
+        return r_recv;
+    }
+    resp_body[resp_body_len] = 0;
+    */
+
+    LOG(DEBUG, "recv[" << resp_header << "][" << resp_body << "]");
+    char errcode[5] = {0};
+    strncpy(errcode, resp_header + 26, 4);
+    if(strncmp(errcode, "0000" , 4) != 0)
+    {
+        ecloaddtl.errcode = atoi(errcode);
+        strcpy(ecloaddtl.errmsg, "应答失败 : ");
+        if(strncmp(errcode, "5001", 4) == 0)
+        {
+            strcat(ecloaddtl.errmsg, "保证金不足");
+        }
+        else
+        {
+            strcat(ecloaddtl.errmsg, "其它错误");
+        }
+        return r_error; // 交易异常
+    }
+    // 银行参考号
+    std::size_t offset = 0;
+    strncpy(ecloaddtl.crrefno, resp_body, 14);
+    trim(ecloaddtl.crrefno);
+    offset += 14;
+    // 记账日期
+    offset += 8;
+    // 实际长度
+    std::size_t field55len = get_buffer_as_int(resp_body + offset, 3);
+    offset += 3;
+    // 55 域
+    if(field55len > body_len - offset)
+    {
+        strcpy(ecloaddtl.errmsg, "55域长度异常");
+        return r_recv;
+    }
+    memset(ecloaddtl.field55, 0, sizeof ecloaddtl.field55);
+    get_buffer_as_str(resp_body + offset, field55len, ecloaddtl.field55);
+    return r_ok;
+}
+
+std::size_t ec_bank_any_bocomm::pack_body(T_t_ecloaddtl& ecloaddtl, char* body, const char* transcode)
+{
+    string accno;
+    get_ec_para(JHEC_SETTLE_ACCNO, accno);
+    stringstream data;
+    // 电子现金预付卡卡号
+    data << std::setw(21) << setfill(' ') << left << ecloaddtl.crbankcardno;
+    // 电子现金账号
+    data << std::setw(21) << setfill(' ') << left << " ";
+    // 校园IC卡号
+    data << std::setw(16) << setfill(' ') << left << ecloaddtl.cardno;
+    // 用户姓名
+    data << std::setw(64) << setfill(' ') << left << " ";
+    //币种
+    data << "001";
+    // 充值金额
+    data << setw(15) << setfill('0') << right << ecloaddtl.amount;
+    // 对公结算账号
+    LOG(DEBUG, "交行对公结算账号: " << accno);
+    data << setw(21) << setfill(' ') << left << accno.c_str();     // 结算账号
+    // 圈存机号
+    data << setw(5) << setfill('0') << (ecloaddtl.termid % 100000);
+    // 业务种类
+    data << "01";
+    // 卡序号
+    data << "001";
+    // 数据长度
+    data << setw(3) << setfill('0') << strlen(ecloaddtl.field55);
+    // 数据内容
+    data << setw(504) << setfill(' ') << left << ecloaddtl.field55;
+	if(strncmp(transcode, "404402", 6)==0)
+	{
+		string refno = ecloaddtl.refno;
+	    if(refno.length() > 20)
+	    {
+	        size_t i = refno.length();
+	        refno = refno.substr(i - 20);
+	    }
+	    data << setw(20) << setfill('0') << left << refno;
+	}
+
+    memcpy(body, data.str().c_str(), data.str().length());
+    return data.str().length();
+}
+
+std::size_t ec_bank_any_bocomm::pack_header(T_t_ecloaddtl& ecloaddtl, char* header,
+                                            const char* transcode, const char* body, std::size_t body_len)
+{
+    string merchid;
+    get_ec_para(JHEC_MECH_ID, merchid);
+    LOG(DEBUG, "交行代理商编号: " << merchid);
+    stringstream data;
+    // 请求码
+    data << setw(6) << setfill(' ') << transcode;
+    // 代理商编号
+    data << setw(6) << setfill(' ') << merchid.c_str();
+    // 交易日期时间
+    char dt[15] = {0};
+    getsysdatetime(dt);
+    data << setw(14) << setfill(' ') << dt;
+    // 处理结果
+    data << "0000";
+    // 系统参考号
+    string refno = ecloaddtl.refno;
+    if(refno.length() > 20)
+    {
+        size_t i = refno.length();
+        refno = refno.substr(i - 20);
+    }
+    data << setw(20) << setfill('0') << left << refno;
+    // MD5
+    MD5_CTX ctx;
+    memset(&ctx, 0, sizeof ctx);
+
+    MD5Update(&ctx, (unsigned char*)body, body_len);
+    unsigned char digest[16];
+    MD5Final(digest, &ctx);
+    data << setw(32) << setfill(' ') << right << encode_hex(digest, 16).c_str();
+
+    memcpy(header, data.str().c_str(), data.str().length());
+    return data.str().length();
+
+}
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// class ec_bank_cash_bocomm : public ec_bank_any_bocomm
+// 现金到交行
+EC_REGISTER_TRANS(CASH_CODE, BANKCOMM_CODE, ec_bank_cash_bocomm);
+ec_bank_cash_bocomm::ec_bank_cash_bocomm()
+{
+    need_payment_ = true;
+    use_margin_acc_ = true;
+}
+ec_bank_cash_bocomm::~ec_bank_cash_bocomm()
+{
+
+}
+int ec_bank_cash_bocomm::send_to_anybank_ykt(T_t_ecloaddtl& ecloaddtl,
+                                             const ec_bank_trans_param& para)
+{
+    // just return 0
+    return 0;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// 工行到工行
+EC_REGISTER_TRANS(ICBC_CODE, ICBC_CODE, ec_bank_icbc);
+int ec_bank_icbc::transfer(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para)
+{
+    LOG(ERROR, "ICBC transfer");
+    int ret = 0;
+    ecloaddtl.usemargin = MARGIN_INIT;
+    this->use_margin_acc_ = false;
+    this->need_payment_ = false;
+    setDRBankcardNo(ecloaddtl.drbankcardno);
+    ret = do_transfer(ecloaddtl, para);
+    ecloaddtl.usemargin = MARGIN_INIT;
+    return ret;
+}
+int ec_bank_icbc::do_transfer(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para)
+{
+
+    string body;
+    int ret;
+    ret = pack_body(ecloaddtl, para, body);
+    if(ret)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        return r_error;
+    }
+    string resp;
+    int retries = 1;
+    while(--retries >= 0)
+    {
+        ret = send_to_icbc(ecloaddtl, body, resp);
+        if(ret == r_recv)
+        {
+            ecloaddtl.usemargin = MARGIN_UNCONFIRMED;
+            ret = retry_to_icbc(ecloaddtl, resp);
+            if(ret != r_ok)
+                return ret;
+        }
+        else
+        {
+            break;
+        }
+    }
+    if(ret != r_ok)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        return ret;
+    }
+
+    TiXmlDocument doc;
+    doc.Parse(resp.c_str());
+    TiXmlElement* root = doc.FirstChildElement();
+    if(!root)
+    {
+        strcpy(ecloaddtl.errmsg, "工行返回数据解析错误");
+        LOG(ERROR, "工行返回数据解析错误");
+        LOG(ERROR, "[" << body << "]");
+        if(ecloaddtl.usemargin == MARGIN_INIT)
+            ecloaddtl.usemargin  = MARGIN_UNCONFIRMED;
+        return r_error;
+    }
+    int retcode = 0;
+    {
+        string value;
+        if(!ec_xml_get_xml_value(*root, "RESCODE", value) || value.empty())
+        {
+            strcpy(ecloaddtl.errmsg, "工行返回数据解析错误");
+            LOG(ERROR, "工行返回数据解析错误");
+            LOG(ERROR, "[" << body << "]");
+            if(ecloaddtl.usemargin == MARGIN_INIT)
+                ecloaddtl.usemargin  = MARGIN_UNCONFIRMED;
+            return r_error;
+        }
+        istringstream is(value);
+        is >> retcode;
+    }
+    if(retcode != 0)
+    {
+        ecloaddtl.errcode = retcode;
+        string errmsg;
+        ec_xml_get_xml_value(*root, "VIEWDATA", errmsg);
+        LOG(DEBUG, "工行返回错误，ret=" << retcode << ",msg=" << errmsg);
+        errmsg = parse_icbc_errmsg(errmsg);
+        des2src(ecloaddtl.errmsg, errmsg.c_str());
+        if(ecloaddtl.usemargin == MARGIN_INIT)
+            ecloaddtl.usemargin  = MARGIN_NOUSE;
+        return r_error;
+    }
+    string icdata;
+    ec_xml_get_xml_value(*root , "ICDATE", icdata);
+    des2src(ecloaddtl.field55, icdata.c_str());
+
+    ecloaddtl.usemargin  = MARGIN_USED;//查询成功也是 已扣
+
+    return r_ok;
+}
+
+int ec_bank_icbc::pack_body(T_t_ecloaddtl& ecloaddtl,
+                            const ec_bank_trans_param& para,
+                            std::string& body)
+{
+    TiXmlDocument doc;
+    {
+        TiXmlElement root("REQUEST");
+        doc.InsertEndChild(root);
+    }
+    char dt[15] = {0};
+    getsysdatetime(dt);
+    string now(dt);
+
+
+    int ret;
+    TiXmlNode& root = *(doc.FirstChild());
+    // 渠道标识
+    ec_add_xml_node_value(root, "CHANNEL", "12");
+    // 交易代码
+    ec_add_xml_node_value(root, "TXCODE", "82112");
+    // 交易地区
+    ec_add_xml_node_value(root, "ZONENO", "3602");
+    // 单位代码
+    string custno;
+    ret = get_ec_para(GHEC_CUSTNO, custno);
+    if(ret)
+    {
+        LOG(ERROR, "接入单位代码未设置");
+        return r_error;
+    }
+    ec_add_xml_node_value(root, "CUSTNO", custno);
+    // 报文标识
+    ec_add_xml_node_value(root, "MSGFLAG", "8989");
+    // 预付卡卡号
+    ec_add_xml_node_value(root, "CRCARDNO", ecloaddtl.crbankcardno);
+    // 交易金额
+    ec_add_xml_node_value(root, "TRXAMT", ecloaddtl.amount);
+    // 电子现金余额
+    ec_add_xml_node_value(root, "EMYBAL", ecloaddtl.ecbalance);
+    // 电子现金圈存上限
+    ec_add_xml_node_value(root, "NBALLIMIT", para["balalimit"]);
+    // 电子现金单笔交易限额
+    ec_add_xml_node_value(root, "NPERPAYLIMIT", para["limitperload"]);
+    // 电子现金余额重置阀值
+    ec_add_xml_node_value(root, "NBALCYCLE", para["balacycle"]);
+    // 传输时间日期 MMDDhhmmss
+    ec_add_xml_node_value(root, "CSTIME", now.substr(4));
+    // 终端流水号
+    {
+        stringstream ss;
+        ss << setw(6) << setfill('0') << ecloaddtl.termseqno;
+        ec_add_xml_node_value(root, "POSSER", ss.str());
+
+    }
+    // 交易日期 YYYYMMDD
+    ec_add_xml_node_value(root, "WORKDATE", ecloaddtl.transdate);
+    // 交易时间 hhmmss
+    ec_add_xml_node_value(root, "WORKTIME", ecloaddtl.transtime);
+    // 有效期
+    ec_add_xml_node_value(root, "EXPRDATE", para["expiredate"]);
+    // 输入方式
+    ec_add_xml_node_value(root, "INPUTTYPE", "052");
+    // IC卡序列号
+    ec_add_xml_node_value(root, "ICQUE", ecloaddtl.cardphyid);
+    // 终端号
+    ec_add_xml_node_value(root, "TERMID", ecloaddtl.termid);
+    // 商场号
+    string merchcode;
+    ret = get_ec_para(GHEC_MECH_ID, merchcode);
+    if(ret)
+    {
+        LOG(ERROR, "商场号未设置!");
+        return r_error;
+    }
+    ec_add_xml_node_value(root, "MERCODE", merchcode);
+    // 第二账号，资金转出账号
+    // ec_add_xml_node_value(root, "DECARDNO", ecloaddtl.drbankcardno);
+    ec_add_xml_node_value(root, "DECARDNO", dr_bankcardno_);
+    // 币种
+    ec_add_xml_node_value(root, "CURRYTYPE", "001");
+    // IC卡特色域
+    ec_add_xml_node_value(root, "ICDATE", ecloaddtl.field55);
+
+    TiXmlPrinter printer;
+    doc.Accept(&printer);
+    body = printer.CStr();
+
+    return 0;
+
+}
+int ec_bank_icbc::pack_post_trans_body(T_t_ecloaddtl& ecloaddtl,
+                                       const ec_bank_trans_param& para,
+                                       int write_card,
+                                       std::string& body)
+{
+    TiXmlDocument doc;
+    {
+        TiXmlElement root("REQUEST");
+        doc.InsertEndChild(root);
+    }
+    char dt[15] = {0};
+    getsysdatetime(dt);
+    string now(dt);
+
+
+    int ret;
+    TiXmlNode& root = *(doc.FirstChild());
+    // 渠道标识
+    ec_add_xml_node_value(root, "CHANNEL", "12");
+    // 交易代码
+    ec_add_xml_node_value(root, "TXCODE", "82113");
+    // 交易地区
+    ec_add_xml_node_value(root, "ZONENO", "3602");
+    // 单位代码
+    string custno;
+    ret = get_ec_para(GHEC_CUSTNO, custno);
+    if(ret)
+    {
+        LOG(ERROR, "接入单位代码未设置");
+        return r_error;
+    }
+    ec_add_xml_node_value(root, "CUSTNO", custno);
+    // 报文标识
+    ec_add_xml_node_value(root, "MSGFLAG", "8989");
+    // 预付卡卡号
+    ec_add_xml_node_value(root, "CRCARDNO", ecloaddtl.crbankcardno);
+    // 交易金额
+    ec_add_xml_node_value(root, "TRXAMT", ecloaddtl.amount);
+    // 电子现金余额
+    ec_add_xml_node_value(root, "EMYBAL", ecloaddtl.ecbalance);
+    // 电子现金圈存上限
+    ec_add_xml_node_value(root, "NBALLIMIT", para["balalimit"]);
+    // 电子现金单笔交易限额
+    ec_add_xml_node_value(root, "NPERPAYLIMIT", para["limitperload"]);
+    // 电子现金余额重置阀值
+    ec_add_xml_node_value(root, "NBALCYCLE", para["balacycle"]);
+    // 传输时间日期 MMDDhhmmss
+    ec_add_xml_node_value(root, "CSTIME", now.substr(4));
+    // 终端流水号
+    ec_add_xml_node_value(root, "POSSER", para["seqno"]);
+    // 交易日期 YYYYMMDD
+    ec_add_xml_node_value(root, "WORKDATE", ecloaddtl.transdate);
+    // 交易时间 hhmmss
+    ec_add_xml_node_value(root, "WORKTIME", ecloaddtl.transtime);
+    // 有效期
+    ec_add_xml_node_value(root, "EXPRDATE", para["expiredate"]);
+    // 输入方式
+    ec_add_xml_node_value(root, "INPUTTYPE", "052");
+    // IC卡序列号
+    ec_add_xml_node_value(root, "ICQUE", ecloaddtl.cardphyid);
+    // 终端号
+    ec_add_xml_node_value(root, "TERMID", ecloaddtl.termid);
+    // 商场号
+    string merchcode;
+    ret = get_ec_para(GHEC_MECH_ID, merchcode);
+    if(ret)
+    {
+        LOG(ERROR, "商场号未设置!");
+        return r_error;
+    }
+    ec_add_xml_node_value(root, "MERCODE", merchcode);
+    // 第二账号，资金转出账号
+    // ec_add_xml_node_value(root, "DECARDNO", ecloaddtl.drbankcardno);
+    ec_add_xml_node_value(root, "DECARDNO", dr_bankcardno_);
+    // 币种
+    ec_add_xml_node_value(root, "CURRYTYPE", "001");
+    {
+        // 特色信息
+        stringstream ss;
+        ss << "FF04" << setw(6) << setfill('0') << ecloaddtl.termseqno;
+        if(write_card == wc_success)
+        {
+            ss << "00";
+        }
+        else
+        {
+            ss << "01";
+        }
+        ec_add_xml_node_value(root, "CHDATA1", ss.str());
+
+    }
+
+    TiXmlPrinter printer;
+    doc.Accept(&printer);
+    body = printer.CStr();
+
+    return 0;
+}
+
+int ec_bank_icbc::post_transfer(T_t_ecloaddtl& ecloaddtl,
+                                const ec_bank_trans_param& para,
+                                int write_card)
+{
+    setDRBankcardNo(ecloaddtl.drbankcardno);
+    return do_post_transfer(ecloaddtl, para, write_card);
+}
+
+int ec_bank_icbc::do_post_transfer(T_t_ecloaddtl& ecloaddtl,
+                                   const ec_bank_trans_param& para,
+                                   int write_card)
+{
+    int ret;
+    std::string body;
+    ret = pack_post_trans_body(ecloaddtl, para, write_card, body);
+    if(ret)
+    {
+        LOG(ERROR, "生成写卡确认数据包错误");
+        return r_error;
+    }
+    string resp;
+    ret = send_to_icbc(ecloaddtl, body, resp);
+    if(ret)
+    {
+        LOG(ERROR, "发送写卡确认失败");
+        return ret;
+    }
+    TiXmlDocument doc;
+    doc.Parse(resp.c_str());
+    TiXmlElement* root = doc.FirstChildElement();
+    if(!root)
+    {
+        strcpy(ecloaddtl.errmsg, "工行返回数据解析错误");
+        LOG(ERROR, "工行返回数据解析错误");
+        LOG(ERROR, "[" << body << "]");
+        return r_error;
+    }
+    int retcode = 0;
+    {
+        string value;
+        if(!ec_xml_get_xml_value(*root, "RESCODE", value) || value.empty())
+        {
+            strcpy(ecloaddtl.errmsg, "工行返回数据解析错误");
+            LOG(ERROR, "工行返回数据解析错误");
+            LOG(ERROR, "[" << body << "]");
+            return r_error;
+        }
+        istringstream is(value);
+        is >> retcode;
+    }
+    if(retcode != 0)
+    {
+        ecloaddtl.errcode = retcode;
+        string errmsg;
+        ec_xml_get_xml_value(*root, "VIEWDATA", errmsg);
+        LOG(DEBUG, "工行返回错误，ret=" << retcode << ",msg=" << errmsg);
+        errmsg = parse_icbc_errmsg(errmsg);
+        des2src(ecloaddtl.errmsg, errmsg.c_str());
+        return r_error;
+    }
+    return r_ok;
+}
+
+int ec_bank_icbc::send_to_icbc(T_t_ecloaddtl& ecloaddtl,
+                               const std::string& req,
+                               std::string& resp)
+{
+    int timeout = 0;
+    string gh_ip;
+    int gh_port;
+    int ret;
+
+	ret = get_ec_para(GHEC_TIMEOUT, timeout);
+    if(ret)
+    {
+        LOG(ERROR, "工行超时时限未配置");
+        return E_COMMON_ERR;
+    }
+
+    timeout *= 1000;
+	
+    ret = get_ec_para(GHEC_SVRIP, gh_ip);
+    if(ret)
+    {
+        LOG(ERROR, "工行前置机未配置");
+        return r_conn;
+    }
+    ret = get_ec_para(GHEC_SVRPORT, gh_port);
+    if(ret)
+    {
+        LOG(ERROR, "工行前置机未配置");
+        return r_conn;
+    }
+    LOG(DEBUG, "工行服务器[" << gh_ip << ":" << gh_port << "]");
+
+    CTcpSocket sock;
+    alarm(timeout / 1000);
+    if(!sock.ConnectTcp((char*)gh_ip.c_str(), gh_port))
+    {
+        alarm(0);
+        strcpy(ecloaddtl.errmsg, "连接工行服务器失败");
+        LOG(ERROR, "connect to bank_of_comm error");
+        return r_conn;
+    }
+    alarm(0);
+
+    // 工行报文
+    stringstream ss;
+    ss << setw(6) << setfill('0') <<  req.length() << req;
+
+    LOG(DEBUG, "工行报文[" << ss.str() << "]");
+    if(sock.Send((char*)ss.str().c_str(), ss.str().length()) < (int)ss.str().length())
+    {
+        strcpy(ecloaddtl.errmsg, "发送数据到工行服务器失败");
+        LOG(ERROR, "Send to bank_of_comm error");
+        return r_send;
+    }
+    // 包头
+    size_t body_len = 0;
+    {
+        char buffer[7] = {0};
+        if(sock.Recv(buffer, 6, timeout) <= 0)
+        {
+            strcpy(ecloaddtl.errmsg, "接收工行返回数据头失败");
+            LOG(ERROR, ecloaddtl.errmsg);
+            return r_recv;
+        }
+        istringstream is(buffer);
+        is >> body_len;
+    }
+    // 包体
+    string body;
+    {
+        char* buffer = new char[body_len + 1];
+        memset(buffer, 0, body_len + 1);
+        if(sock.Recv(buffer, body_len, timeout) <= 0)
+        {
+            strcpy(ecloaddtl.errmsg, "接收工行返回数据内容失败");
+            LOG(ERROR, ecloaddtl.errmsg);
+            delete [] buffer;
+            return r_recv;
+        }
+        body = buffer;
+        delete [] buffer;
+
+        resp = body;
+    }
+    return r_ok;
+}
+std::string ec_bank_icbc::parse_icbc_errmsg(const std::string& errmsg)
+{
+    size_t offset = 0;
+    if(errmsg.substr(offset, 2) == "F0")
+    {
+        offset += 2;
+    }
+    size_t msglen = 0;
+    {
+        istringstream is(errmsg.substr(offset, 2));
+        is >> hex >> msglen;
+        msglen *= 2;
+        offset += 2;
+    }
+    msglen = min(msglen, errmsg.length() - offset);
+    string temp = errmsg.substr(offset, msglen);
+    unsigned char* buffer = new unsigned char[temp.length() / 2 + 1];
+    memset(buffer, 0, temp.length() / 2 + 1);
+    decode_hex(temp, buffer);
+    string result = (char*)buffer;
+    delete [] buffer;
+    return result;
+}
+int ec_bank_icbc::retry_to_icbc(T_t_ecloaddtl& ecloaddtl, std::string& resp)
+{
+    int ret;
+    string req;
+    LOG(DEBUG, "查询工行交易流水");
+    ret = pack_query_body(ecloaddtl, req);
+    if(ret)
+    {
+        return r_error;
+    }
+    LOG(DEBUG, "发送查询请求[" << req << "]");
+    ret = send_to_icbc(ecloaddtl, req, resp);
+    if(ret)
+    {
+        return ret;
+    }
+    LOG(DEBUG, "查询工行应答数据[" << resp << "]");
+    return 0;
+}
+int ec_bank_icbc::pack_query_body(T_t_ecloaddtl& ecloaddtl, std::string& body)
+{
+    TiXmlDocument doc;
+    {
+        TiXmlElement root("REQUEST");
+        doc.InsertEndChild(root);
+    }
+    char dt[15] = {0};
+    getsysdatetime(dt);
+    string now(dt);
+
+
+    int ret;
+    TiXmlNode& root = *(doc.FirstChild());
+    // 渠道标识
+    ec_add_xml_node_value(root, "CHANNEL", "12");
+    // 交易代码
+    ec_add_xml_node_value(root, "TXCODE", "82114");
+    // 交易地区
+    ec_add_xml_node_value(root, "ZONENO", "3602");
+    // 单位代码
+    string custno;
+    ret = get_ec_para(GHEC_CUSTNO, custno);
+    if(ret)
+    {
+        LOG(ERROR, "接入单位代码未设置");
+        return r_error;
+    }
+    ec_add_xml_node_value(root, "CUSTNO", custno);
+    // 报文标识
+    ec_add_xml_node_value(root, "MSGFLAG", "8989");
+    // 预付卡卡号
+    ec_add_xml_node_value(root, "CRCARDNO", ecloaddtl.crbankcardno);
+    // 传输时间日期 MMDDhhmmss
+    ec_add_xml_node_value(root, "CSTIME", now.substr(4));
+    // 终端流水号
+    {
+        stringstream ss;
+        ss << setw(6) << setfill('0') << (ecloaddtl.termseqno);
+        ec_add_xml_node_value(root, "POSSER", ss.str());
+
+    }
+    // 交易日期 YYYYMMDD
+    ec_add_xml_node_value(root, "WORKDATE", ecloaddtl.transdate);
+    // 交易时间 hhmmss
+    ec_add_xml_node_value(root, "WORKTIME", ecloaddtl.transtime);
+    // 输入方式
+    ec_add_xml_node_value(root, "INPUTTYPE", "052");
+    // IC卡序列号
+    ec_add_xml_node_value(root, "ICQUE", ecloaddtl.cardphyid);
+    // 终端号
+    ec_add_xml_node_value(root, "TERMID", ecloaddtl.termid);
+    // 商场号
+    string merchcode;
+    ret = get_ec_para(GHEC_MECH_ID, merchcode);
+    if(ret)
+    {
+        LOG(ERROR, "商场号未设置!");
+        return r_error;
+    }
+    ec_add_xml_node_value(root, "MERCODE", merchcode);
+    // 第二账号，资金转出账号
+    // ec_add_xml_node_value(root, "DECARDNO", ecloaddtl.drbankcardno);
+    ec_add_xml_node_value(root, "DECARDNO", dr_bankcardno_);
+
+    // IC卡特色域
+    ec_add_xml_node_value(root, "ICDATE", ecloaddtl.field55);
+
+    TiXmlPrinter printer;
+    doc.Accept(&printer);
+    body = printer.CStr();
+
+    return r_ok;
+}
+void ec_bank_icbc::setDRBankcardNo(const std::string& drbankno)
+{
+    this->dr_bankcardno_ = drbankno;
+}
+////////////////////////////////////////////////////////////////////////////////////////
+EC_REGISTER_TRANS(BANK_ANY_CODE, ICBC_CODE, ec_bank_any_to_icbc);
+int ec_bank_any_to_icbc::transfer(T_t_ecloaddtl& ecloaddtl,
+                                  const ec_bank_trans_param& para)
+{
+    this->use_margin_acc_ = true;
+    this->need_payment_ = true;
+    ecloaddtl.usemargin = MARGIN_INIT;
+    std::string drbankno;
+    LOG(ERROR, "Any Bank ICBC transfer");
+    int ret;
+    ret = get_ec_para(GHEC_MARGIN_ACCOUNT, drbankno);
+    if(ret)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        LOG(ERROR, "参数未配置");
+        return r_error;
+    }
+    LOG(DEBUG, "工行电子现金圈存，等待向一卡通圈存系统请求...");
+    ret = send_to_anybank_ykt(ecloaddtl , para);
+    if(ret)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        ERRTIP("下账失败");
+        return ret;
+    }
+    //ecloaddtl.usemargin = MARGIN_NOUSE;
+    setDRBankcardNo(drbankno);
+    return do_transfer(ecloaddtl, para);
+}
+int ec_bank_any_to_icbc::post_transfer(T_t_ecloaddtl& ecloaddtl,
+                                       const ec_bank_trans_param& para,
+                                       int write_card)
+{
+    std::string drbankno;
+    int ret;
+    ret = get_ec_para(GHEC_MARGIN_ACCOUNT, drbankno);
+    if(ret)
+    {
+        LOG(ERROR, "参数未配置");
+        ERRTIP("参数未配置");
+        return r_error;
+    }
+    setDRBankcardNo(drbankno);
+    return do_post_transfer(ecloaddtl, para, write_card);
+}
+////////////////////////////////////////////////////////////////////////////////////////
+EC_REGISTER_TRANS(CASH_CODE, ICBC_CODE, ec_bank_cash_to_icbc);
+int ec_bank_cash_to_icbc::transfer(T_t_ecloaddtl& ecloaddtl,
+                                   const ec_bank_trans_param& para)
+{
+    this->use_margin_acc_ = true;
+    LOG(ERROR, "Cash ICBC transfer");
+    ecloaddtl.usemargin = MARGIN_INIT;
+    std::string drbankno;
+    int ret;
+    ret = get_ec_para(GHEC_MARGIN_ACCOUNT, drbankno);
+    if(ret)
+    {
+        ecloaddtl.usemargin = MARGIN_NOUSE;
+        LOG(ERROR, "参数未配置");
+        return r_error;
+    }
+    setDRBankcardNo(drbankno);
+    LOG(DEBUG, "ICBC debit bankcardno: [" << drbankno << "]");
+    return do_transfer(ecloaddtl, para);
+}
+int ec_bank_cash_to_icbc::post_transfer(T_t_ecloaddtl& ecloaddtl,
+                                        const ec_bank_trans_param& para,
+                                        int write_card)
+{
+    std::string drbankno;
+    int ret;
+    ret = get_ec_para(GHEC_MARGIN_ACCOUNT, drbankno);
+    if(ret)
+    {
+        LOG(ERROR, "参数未配置");
+        ERRTIP("参数未配置");
+        return r_error;
+    }
+    setDRBankcardNo(drbankno);
+    return do_post_transfer(ecloaddtl, para, write_card);
+}
+////////////////////////////////////////////////////////////////////////////////////////

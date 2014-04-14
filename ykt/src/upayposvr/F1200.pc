@@ -1,0 +1,225 @@
+/* --------------------------------------------
+ * 创建日期: 2011-11-21
+ * 程序作者: 闻剑
+ * 版本信息: 1.0.0.0
+ * 程序功能: 保存消费流水
+ * --------------------------------------------*/
+
+#define _IN_SQC_
+#include <stdio.h>
+#include <string.h>
+#include "pubdef.h"
+#include "errdef.h"
+#include "pubfunc.h"
+#include "pubdb.h"
+#include "dbfunc.h"
+#include "transcode.h"
+#include "dbfunc_foo.h"
+#include "acctrans.h"
+#include "unitfunc.h"
+#include "config_imp.h"
+#include "ks_8583_reader.h"
+#include "unionpaypos.h"
+static int GetNextPosDataID(int* id)
+{
+    EXEC SQL BEGIN DECLARE SECTION;
+        int ho_id = 0;
+    EXEC SQL END DECLARE SECTION;
+    SQLCODE = 0;
+    EXEC SQL
+    SELECT  S_POSDATA_ID.nextval into:ho_id FROM dual;
+    if(SQLCODE)
+    {
+        db_chk_err(__FILE__, __LINE__, &sqlca);
+        if(SQLCODE == -2289)
+        {
+            DynamicStmtExecute("CREATE SEQUENCE S_POSDATA_ID INCREMENT BY 1 START WITH 1  MAXVALUE 999999999 CYCLE  CACHE 100 ORDER");
+            return SQLCODE;
+        }
+        else
+        {
+            ERRTIP("生成POS流水ID错误 ret=%d", SQLCODE);
+            return SQLCODE;
+        }
+    }
+    *id = ho_id;
+    return 0;
+}
+FUNCTION(1200)
+{
+    int ret = 0;
+    char szPosData[1024];
+    POSDTLFILE  PosdtlFile;
+    memset(&PosdtlFile, 0, sizeof(PosdtlFile));
+    sprintf(PosdtlFile.refno, "%012d", 1);
+    gReader.fetchRow();
+    std::string data;
+    COL2VAR(data);
+    if(data.size() < 1)
+    {
+        ERRTIP("消息长度为空");
+        LOG(ERROR, "data error");
+        return E_COMMON_ERR;
+    }
+    if(data.size() > 2000)
+    {
+        ERRTIP("消息长度超过2000");
+        LOG(ERROR, "消息长度超过2000");
+        return E_COMMON_ERR;
+    }
+    Ks8583Parser* pParser = Ks8583Parser::GetInstance("unionpaypos");
+    if(!pParser)
+    {
+        LOG(ERROR, "get 8583 parser instance failed");
+        return E_COMMON_ERR;
+    }
+    CUnionPayPos unionPayPos(*pParser);
+    int posbatchno = 0;
+    string msgtype;
+    int infocode = 0;
+    if(!unionPayPos.getMsgType(data.c_str(), data.size(), msgtype, infocode))
+    {
+        LOG(ERROR, "getMsgType error,parse pos data failed");
+        return E_COMMON_ERR;
+    }
+    if("0200" == msgtype)
+    {
+        T_t_upayposdata posData;
+        memset(&posData, 0, sizeof(posData));
+        ret = GetNextPosDataID(&posData.posdataid);
+        if(ret)
+        {
+            LOG(ERROR, "GetNextPosDataID ret=" << ret);
+            unionPayPos.packErrRespData("0210", "30", PosdtlFile, szPosData);
+            gWriter.col["data"] = szPosData;
+            gWriter.addRow();
+            return 0;
+        }
+        posData.status = 0;
+        posData.datalen = data.size();
+        des2src(posData.posdata, data.c_str());
+        des2src(posData.crttime, CAccTrans::GetInst().trans.sysdatetime);
+        ret = DB_t_upayposdata_add(&posData);
+        if(ret)
+        {
+            LOG(ERROR, "保存POS流水失败");
+            unionPayPos.packErrRespData("0210", "30", PosdtlFile, szPosData);
+            gWriter.col["data"] = szPosData;
+            gWriter.addRow();
+            return 0;
+        }
+        ret = db_commit();
+        if(ret)
+        {
+            LOG(ERROR, "提交保存流水失败");
+            unionPayPos.packErrRespData("0210", "30", PosdtlFile, szPosData);
+            gWriter.col["data"] = szPosData;
+            gWriter.addRow();
+            return 0;
+        }
+        if(!unionPayPos.parsePosData(PosdtlFile, false))
+        {
+            LOG(ERROR, "parse pos data error");
+            unionPayPos.packErrRespData("0210", "30", PosdtlFile, szPosData);
+            gWriter.col["data"] = szPosData;
+            gWriter.addRow();
+            return 0;
+        }
+        sprintf(PosdtlFile.refno, "%012d", posData.posdataid);
+        if(!unionPayPos.packPosRespData(PosdtlFile, szPosData))
+        {
+            LOG(ERROR, "pack succ resp data error!");
+            unionPayPos.packErrRespData("0210", "06", PosdtlFile, szPosData);
+        }
+        gWriter.col["data"] = szPosData;
+        gWriter.addRow();
+    }
+    else if("0800" == msgtype && 3 == infocode)
+    {
+        LOG(DEBUG, "pos signin ");
+        //签到
+        if(!unionPayPos.parseSignInData(PosdtlFile))
+        {
+            LOG(ERROR, "parse pos data error");
+            unionPayPos.packErrRespData("0810", "30", PosdtlFile, szPosData);
+            gWriter.col["data"] = szPosData;
+            gWriter.addRow();
+            return 0;
+        }
+        T_t_termmap termmap;
+        memset(&termmap, 0, sizeof(termmap));
+        string termno(PosdtlFile.termno, sizeof(PosdtlFile.termno));
+        string merchno(PosdtlFile.merchno, sizeof(PosdtlFile.merchno));
+        ret = DB_t_termmap_read_by_termno_and_merchno(termno.c_str(), merchno.c_str(), &termmap);
+        if(ret)
+        {
+            if(DB_NOTFOUND == ret)
+            {
+                LOG(ERROR, "termno[" << termno << "],merchno[" << merchno << " not found");
+                unionPayPos.packErrRespData("0810", "97", PosdtlFile, szPosData);
+                gWriter.col["data"] = szPosData;
+                gWriter.addRow();
+                return 0;
+            }
+            else
+            {
+                LOG(ERROR, "query error,termno[" << termno << "]");
+                unionPayPos.packErrRespData("0810", "96", PosdtlFile, szPosData);
+                gWriter.col["data"] = szPosData;
+                gWriter.addRow();
+                return 0;
+            }
+        }
+        if(!unionPayPos.packSignInRespData(PosdtlFile, szPosData))
+        {
+            LOG(ERROR, "pack succ resp data error!");
+            unionPayPos.packErrRespData("0810", "06", PosdtlFile, szPosData);
+        }
+        gWriter.col["data"] = szPosData;
+        gWriter.addRow();
+    }
+    else if("0820" == msgtype && 372 == infocode)
+    {
+        //POS状态上送
+        if(!unionPayPos.doPosStausData(PosdtlFile, szPosData))
+        {
+            LOG(ERROR, "pack succ resp data error!");
+            unionPayPos.packErrRespData("0830", "06", PosdtlFile, szPosData);
+        }
+        gWriter.col["data"] = szPosData;
+        gWriter.addRow();
+    }
+    else if("0820" == msgtype && 382 == infocode)
+    {
+        LOG(ERROR, "pos msgtype[" << msgtype << "]infocode[" << infocode << "] no support");
+        unionPayPos.packErrRespData("0830", "40", PosdtlFile, szPosData);
+        gWriter.col["data"] = szPosData;
+        gWriter.addRow();
+    }
+    else if("0800" == msgtype && 370 == infocode)
+    {
+        if(!unionPayPos.doPosPubKeyData(PosdtlFile, szPosData))
+        {
+            unionPayPos.packErrRespData("0810", "06", PosdtlFile, szPosData);
+        }
+        gWriter.col["data"] = szPosData;
+        gWriter.addRow();
+    }
+    else if("0800" == msgtype && 371 == infocode)
+    {
+        if(!unionPayPos.doPosPubKeyDataEnd(PosdtlFile, szPosData))
+        {
+            unionPayPos.packErrRespData("0810", "06", PosdtlFile, szPosData);
+        }
+        gWriter.col["data"] = szPosData;
+        gWriter.addRow();
+    }
+    else
+    {
+        LOG(ERROR, "pos msgtype[" << msgtype << "]infocode[" << infocode << "] no support");
+        unionPayPos.packErrRespData("0810", "40", PosdtlFile, szPosData);
+        gWriter.col["data"] = szPosData;
+        gWriter.addRow();
+    }
+    return 0;
+}

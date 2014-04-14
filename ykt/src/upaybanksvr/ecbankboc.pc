@@ -1,0 +1,845 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <string>
+#include <sstream>
+#include <cassert>
+#include <errno.h>
+#include <iomanip>
+#include <stdexcept>
+#include <map>
+#include "errdef.h"
+#include "unitfunc.h"
+#include "upaybanksvr.h"
+#include "md5.h"
+#include "tcp.h"
+#include "tinyxml.h"
+#include "ecbankfunc.h"
+#include "cpack.h"
+#include "bupub.h"
+#include "bufunc.h"
+#include "8583_impl.h"
+#include "ks_8583_reader.h"
+
+using namespace std;
+EXEC SQL INCLUDE SQLCA;
+
+#ifndef MAX_TRANS_AMT_ONCE
+#define MAX_TRANS_AMT_ONCE 51
+#endif
+
+#ifndef TERMINAL_IDENTIFICATION
+#define TERMINAL_IDENTIFICATION 52
+#endif
+
+#ifndef ACCEPTOR_IDENTIFICATION
+#define ACCEPTOR_IDENTIFICATION 53
+#endif
+
+
+#ifndef BOCEC_SVRIP
+#define BOCEC_SVRIP 21
+#endif
+
+#ifndef BOCEC_SVRPORT
+#define BOCEC_SVRPORT 22
+#endif
+
+extern CSvrLink* g_pSvrLink;  // 与业务调度中心的连接
+
+////////////////////////////////////////////////////////////////////////////////
+
+
+class ec_bank_cash_boc : public ec_bank_trans
+{
+public:
+    ec_bank_cash_boc();
+    virtual ~ec_bank_cash_boc();
+    int transfer(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para);
+    int post_transfer(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para, int write_card);
+protected:
+	//virtual int send_to_anybank(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para);
+	int send_to_boc(T_t_ecloaddtl& ecloaddtl, const std::string& req, std::string& resp);
+    bool pack_body(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para, std::string& body);
+    bool pack_reverse_body(T_t_ecloaddtl& ecloaddtl,const ec_bank_trans_param& para, std::string& body);
+	int reverse_to_boc(T_t_ecloaddtl& ecloaddtl, const std::string& req, std::string& resp);
+	//int pack_post_trans_body(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para, int write_card,  std::string& body);
+
+};
+
+
+////////////////////////////////////////////////////////////
+// ec_bank_cash_boc : 现金 to  中行
+EC_REGISTER_TRANS(CASH_CODE, BOC_CODE, ec_bank_cash_boc);
+
+ec_bank_cash_boc::ec_bank_cash_boc()
+{
+}
+ec_bank_cash_boc::~ec_bank_cash_boc()
+{
+}
+
+static string tag_hex2str(string str)
+{
+        size_t i;
+		char j;
+		string str1;
+        char tmp[3]="";
+        for(i = 0;i < str.length(); i+=2)
+        {
+                memcpy(tmp,str.substr(i,2).c_str(),2);
+                j=strtoul(tmp,NULL,16);
+                str1.append(1, j);
+        }
+        return str1;
+}
+
+int ec_bank_cash_boc::transfer(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para)
+{
+    
+    int ret;
+    string body;
+	string body_rev;
+	int reverse_flag=0;
+	
+	LOG(DEBUG, "编制请求报文");
+    ret = pack_body(ecloaddtl, para, body);
+    if (ret)
+    {
+        return r_error;
+    }
+    string resp;
+	//string resp_rev;
+    //int retries = 10;
+	LOG(DEBUG, "发送请求报文");
+	ret = send_to_boc(ecloaddtl, body, resp);
+	//ret=r_recv;//测试冲正报文
+	if (ret == r_recv)
+	{	
+		reverse_flag=1;
+		LOG(DEBUG, "编制冲正请求报文");
+		//int write_card=1;
+		body="";
+		ret=pack_reverse_body(ecloaddtl, para, body);
+		if (ret!=0)
+			return r_error;
+		/*while (--retries >= 0)
+		{
+
+			ret = reverse_to_boc(ecloaddtl, body, resp);
+			
+			if (ret != r_ok)
+				sleep(5000);
+			else
+				break;
+			
+        }*/
+		LOG(DEBUG, "发送冲正请求报文");
+		ret = reverse_to_boc(ecloaddtl, body, resp);
+		if (ret != r_ok)
+		{
+			strcpy(ecloaddtl.errmsg, "接受银行信息失败,冲正未成功");
+			LOG(ERROR, "接受银行信息失败,冲正未成功");
+		}
+    }
+    if (ret != r_ok)
+    {
+        return ret;
+    }
+	//解密
+	/*
+	*/
+	Ks8583Parser* pParser = Ks8583Parser::GetInstance("boc8583");
+    if(!pParser)
+    {
+        LOG(ERROR, "Local: get 8583 parser instance failed");
+        return r_error;
+    }
+    pParser->Clear();
+	
+	ret = pParser->UnpackData(resp.c_str(), resp.length());
+    if ( ret )
+    {
+        strcpy(ecloaddtl.errmsg, "中行返回数据解析错误");
+        LOG(ERROR, "中行返回数据解析错误");
+        LOG(ERROR, "[" << resp << "]");
+        return r_error;
+    }
+	
+	size_t fieldno = 39;
+	std::string sFieldVal;
+	
+
+	//检验mac
+	/*string mac_info;
+	ec_xml_get_xml_value(*Return_Field, "MESG_AUTHN_CODE", mac_info)
+	ret=check_mac(mac_info,resp);
+	if (ret)
+		return ret;
+	*/
+	//解析报文
+	LOG(DEBUG, "[" << resp << "]");
+    int retcode = 0;
+	
+ 	if(pParser->GetValueByIndex(fieldno, &retcode) < 0)
+    {
+		strcpy(ecloaddtl.errmsg, "get field \"Response Code\" error.");
+        LOG(ERROR, "get field \"Response Code\" error.");
+		LOG(ERROR, "[" << resp << "]");
+        return r_error;
+    }
+    if (retcode != 0)
+    {
+        ecloaddtl.errcode = retcode;
+		LOG(ERROR, "[" << resp << "]");
+		LOG(ERROR, "中行业务处理未成功");
+        des2src(ecloaddtl.errmsg, "中行业务处理未成功");
+        return r_error;
+    }
+	if (reverse_flag==1)
+	{
+		LOG(DEBUG, "冲正成功.");
+		strcpy(ecloaddtl.errmsg, "圈存失败,但是冲正成功");
+		return r_error;
+	}
+	
+	fieldno = 55;
+
+	LOG(ERROR, "开始转换");
+	if(pParser->GetValueByIndex(fieldno, sFieldVal) < 0)
+    {
+		strcpy(ecloaddtl.errmsg, "get field \"Ic Data\" error.");
+        LOG(ERROR, "get field \"Ic Data\" error.");
+		LOG(ERROR, "[" << resp << "]");
+        return r_error;
+    }
+	
+	LOG(DEBUG,"55域tlv："<<sFieldVal.c_str());
+	LOG(DEBUG, "[" << resp << "]");
+
+    des2src(ecloaddtl.field55, sFieldVal.c_str());
+    return r_ok;
+}
+
+
+
+
+bool ec_bank_cash_boc::pack_body(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para, std::string& body)
+{
+    int ret = 0;
+	char dt[15] = {0};
+	getsysdatetime(dt);
+    string now(dt);
+	string value("");
+	stringstream ss;
+	
+	
+	Ks8583Parser* pParser = Ks8583Parser::GetInstance("boc8583");
+    if(!pParser)
+    {
+        LOG(ERROR, "get 8583 parser instance failed");
+        return false;
+    }
+    pParser->Clear();
+    ret = pParser->SetValueByIndex(0, "0200");
+    if(ret < 0)
+        return false;
+	ret = pParser->SetValueByIndex(2, ecloaddtl.crbankcardno, sizeof(ecloaddtl.crbankcardno));
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(3, "680000");//交易码
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(4, ecloaddtl.amount);//交易金额
+    if(ret < 0)
+        return false;
+	{
+		value=value.erase(0, value.length());
+		ret = get_ec_para(MAX_TRANS_AMT_ONCE, value);
+		if (ret)
+		{
+			LOG(ERROR, "单笔交易限额未配置");
+			return false;
+		}
+	
+		ret = pParser->SetValueByIndex(5, value);//单笔交易限额*
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(6, ecloaddtl.ecbalance);//卡片余额
+	if(ret < 0)
+		return false;
+	{
+		string str(ecloaddtl.accdate);
+		str.append(ecloaddtl.acctime);
+		str=str.substr(2);
+		ret = pParser->SetValueByIndex(7, str);//交易日期时间MMDDhhmmss
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(11, ecloaddtl.refno + 8, 6);//系统跟踪号
+	if(ret < 0)
+		return false;
+	
+    ret = pParser->SetValueByIndex(12, now.substr(8));//当地时间
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(13, now.substr(0,8));//当地日期
+    if(ret < 0)
+        return false;
+	ret = pParser->SetValueByIndex(14, "4912");//卡过期年月*
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(23, "001");//同主账号序列号*无tag_5F34
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(25, "02");//POS状况代码
+    if(ret < 0)
+        return false;
+	{
+		string str;
+		ss.str("");
+		int i;
+		char startdate[9]="";
+		strncpy(startdate, ecloaddtl.accdate, 4);
+		strcat(startdate, "0101");
+		
+		ret = DiffDay(ecloaddtl.accdate, startdate, &i);
+		if (ret)
+			return false;
+		
+		ss<<str[3]<<setw(3)<<setfill('0')<<right<<i+1;
+		ss<<ecloaddtl.acctime[0]<<ecloaddtl.acctime[1]<<ecloaddtl.refno + 8;
+		
+		ret = pParser->SetValueByIndex(37, ss.str().c_str(), 12);//文档参考号
+		if(ret < 0)
+			return false;
+	}
+	{
+		value=value.erase(0, value.length());
+		ret = get_ec_para(TERMINAL_IDENTIFICATION, value);
+		if (ret)
+		{
+			LOG(ERROR, "终端编号未配置");
+			return false;
+		}
+	
+		ret = pParser->SetValueByIndex(41, value);//终端编号 4位ATM网点联行号+4位ATM号*
+		if(ret < 0)
+			return false;
+	}
+	{
+		value=value.erase(0, value.length());
+		ret = get_ec_para(ACCEPTOR_IDENTIFICATION, value);
+		if (ret)
+		{
+			LOG(ERROR, "商户号未配置");
+			return false;
+		}
+
+		ret = pParser->SetValueByIndex(42, value);//商户或者网点编号*
+		if(ret < 0)
+			return false;
+	}
+	/*{
+		ss.str("");
+		//4个取款钞箱状态(n1)
+		ss<<'0'<<'0'<<'0'<<'0';
+		//4个取款钞箱出钞数(n2)
+		ss<<setw(2)<<setfill('0')<<"00";
+		ss<<setw(2)<<setfill('0')<<"00";
+		ss<<setw(2)<<setfill('0')<<"00";
+		ss<<setw(2)<<setfill('0')<<"00";
+		//流水打印机状态
+		ss<<'0';
+		//凭条打印机状态
+		ss<<'0';
+		//存款模块状态
+		ss<<'0';
+		//ATM状态
+		ss<<'O';//Open
+		//4个存款钞箱状态
+		ss<<'0'<<'0'<<'0'<<'0';
+		
+		ret = pParser->SetValueByIndex(48, ss.str());//私用，可选*
+		if(ret < 0)
+			return false;
+	}*/
+    ret = pParser->SetValueByIndex(49, "156");//货币代码
+    if(ret < 0)
+        return false;
+	ret = pParser->SetValueByIndex(53, "2600000000000000");//PIN block的补充信息
+    if(ret < 0)
+        return false;
+	{
+		ss.str("");
+		//processing code(n2)
+		ss<<"68";
+		//Amount type(n2)
+		ss<<"95";
+		//currency code of amount(n3)
+		ss<<"156";
+		//‘D’ - for debit amount of ‘C’ for credit amount
+		ss<<"D";
+		//Amount(n12)
+		ss<<setw(12)<<setfill('0')<<0;
+		
+		ret = pParser->SetValueByIndex(54, ss.str());//金额及相关帐户数据信息
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(55, ecloaddtl.field55, sizeof(ecloaddtl.field55));//IC卡交易使用数据
+	if(ret < 0)
+		return false;
+	
+	{
+		ss.str("");
+		//第一子域PD
+		ss<<"PD";
+		ss<<"050";//PD值长度
+			//PD.1(n4)
+			ss<<"0000";
+			//PD.2(n11)
+				//PD.2.1：保留使用
+				ss<<"0";
+				//PD.2.2：保留使用
+				ss<<"0";
+				//PD.2.3：保留使用
+				ss<<"0";
+				//PD.2.4：保留使用
+				ss<<"0";
+				//PD.2.5：终端类型
+				ss<<"01";//ATM
+				//PD.2.6：保留使用
+				ss<<"0";
+				//PD.2.7：保留使用
+				ss<<"0";
+				//PD.2.8：保留使用
+				ss<<"00";
+				//PD.2.9：保留使用
+				ss<<"0";
+			//PD.3(ans15)	
+				//PD.3.1：特殊计费类型
+				ss<<"00";//00 01
+				//PD.3.2：特殊计费档次
+				ss<<"0";//0 1 2
+				//PD.3.3：保留使用
+				ss<<"000";
+				//PD.3.4：保留使用
+				ss<<"0";
+				//PD.3.5：交易发起方式
+				ss<<"0";//0 1 2
+				//PD.3.6：卡介质
+				ss<<"0";
+				//PD.3.7：保留使用
+				ss<<"0";
+				//PD.3.8：保留使用
+				ss<<"00";
+				//PD.3.9：保留使用
+				ss<<"0";
+				//PD.3.10：保留使用
+				ss<<"00";
+				//PD.3.11：保留使用
+				ss<<setw(20)<<setfill('0')<<"0";
+
+		ret = pParser->SetValueByIndex(60, ss.str());//金融IC卡上送的数据
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(64, "ABCDEF");//mac
+	if(ret < 0)
+		return false;
+		
+		
+	BufferType msg;
+    size_t msglen = 0;
+    size_t pack8583len = 0;
+
+    pParser->PackData(msg.begin() + msglen, &pack8583len, NULL);
+    msglen += pack8583len;
+    LOG(DEBUG, "\n" << msg.data());
+    body=body.erase(0, body.length());
+	body.append(msg.data());
+    LOG(DEBUG, "msglen:" << msglen);
+    LOG(DEBUG, "data:" << body);
+    return true;
+
+}
+
+bool ec_bank_cash_boc::pack_reverse_body(T_t_ecloaddtl& ecloaddtl,const ec_bank_trans_param& para, std::string& body)
+{
+    int ret = 0;
+    char dt[15] = {0};
+	getsysdatetime(dt);
+    string now(dt);
+	string value("");
+	stringstream ss;
+	
+	
+	Ks8583Parser* pParser = Ks8583Parser::GetInstance("boc8583");
+    if(!pParser)
+    {
+        LOG(ERROR, "get 8583 parser instance failed");
+        return false;
+    }
+    pParser->Clear();
+    ret = pParser->SetValueByIndex(0, "0200");
+    if(ret < 0)
+        return false;
+	ret = pParser->SetValueByIndex(2, ecloaddtl.crbankcardno, sizeof(ecloaddtl.crbankcardno));
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(3, "680000");//交易码
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(4, ecloaddtl.amount);//交易金额
+    if(ret < 0)
+        return false;
+	{
+		value=value.erase(0, value.length());
+		ret = get_ec_para(MAX_TRANS_AMT_ONCE, value);
+		if (ret)
+		{
+			LOG(ERROR, "单笔交易限额未配置");
+			return false;
+		}
+	
+		ret = pParser->SetValueByIndex(5, value);//单笔交易限额*
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(6, ecloaddtl.ecbalance);//卡片余额
+    if(ret < 0)
+        return false;
+	{
+		string str(ecloaddtl.accdate);
+		str.append(ecloaddtl.acctime);
+		str=str.substr(2);
+		ret = pParser->SetValueByIndex(7, str);//交易日期时间MMDDhhmmss
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(11, ecloaddtl.refno + 8, 6);//系统跟踪号
+	if(ret < 0)
+		return false;
+	
+    ret = pParser->SetValueByIndex(12, now.substr(8));//当地时间
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(13, now.substr(0,8));//当地日期
+    if(ret < 0)
+        return false;
+	ret = pParser->SetValueByIndex(14, "4912");//卡过期年月*
+    if(ret < 0)
+        return false;
+		
+	ret = pParser->SetValueByIndex(18, "6011");//商户的业务或者服务分类码
+    if(ret < 0)
+        return false;
+
+		
+	ret = pParser->SetValueByIndex(22, "000");//PAN输入交换系统的方式*
+	//PAN Entry Code(n2) PIN Entry Code(n1)
+    if(ret < 0)	
+		return false;
+		
+    ret = pParser->SetValueByIndex(23, "001");//同主账号序列号*
+    if(ret < 0)
+        return false;
+    ret = pParser->SetValueByIndex(25, "02");//POS状况代码
+    if(ret < 0)
+        return false;
+	{
+		string str;
+		ss.str("");
+		int i;
+		char startdate[9]="";
+		strncpy(startdate, ecloaddtl.accdate, 4);
+		strcat(startdate, "0101");
+		
+		ret = DiffDay(ecloaddtl.accdate, startdate, &i);
+		if (ret)
+			return false;
+		
+		ss<<str[3]<<setw(3)<<setfill('0')<<right<<i+1;
+		ss<<ecloaddtl.acctime[0]<<ecloaddtl.acctime[1]<<ecloaddtl.refno + 8;
+		
+		ret = pParser->SetValueByIndex(37, ss.str().c_str(), 12);//文档参考号
+		if(ret < 0)
+			return false;
+	}
+
+	{
+		value=value.erase(0, value.length());
+		ret = get_ec_para(TERMINAL_IDENTIFICATION, value);
+		if (ret)
+		{
+			LOG(ERROR, "终端编号未配置");
+			return false;
+		}
+	
+		ret = pParser->SetValueByIndex(41, value);//终端编号 4位ATM网点联行号+4位ATM号*
+		if(ret < 0)
+			return false;
+	}
+	{
+		value=value.erase(0, value.length());
+		ret = get_ec_para(ACCEPTOR_IDENTIFICATION, value);
+		if (ret)
+		{
+			LOG(ERROR, "商户号未配置");
+			return false;
+		}
+
+		ret = pParser->SetValueByIndex(42, value);//商户或者网点编号*
+		if(ret < 0)
+			return false;
+	}
+	/*{
+		ss.str("");
+		//4个取款钞箱状态(n1)
+		ss<<'0'<<'0'<<'0'<<'0';
+		//4个取款钞箱出钞数(n2)
+		ss<<setw(2)<<setfill('0')<<"00";
+		ss<<setw(2)<<setfill('0')<<"00";
+		ss<<setw(2)<<setfill('0')<<"00";
+		ss<<setw(2)<<setfill('0')<<"00";
+		//流水打印机状态
+		ss<<'0';
+		//凭条打印机状态
+		ss<<'0';
+		//存款模块状态
+		ss<<'0';
+		//ATM状态
+		ss<<'O';//Open
+		//4个存款钞箱状态
+		ss<<'0'<<'0'<<'0'<<'0';
+		
+		ret = pParser->SetValueByIndex(48, ss.str());//私用，可选*
+		if(ret < 0)
+			return false;
+	}*/
+	
+	
+    ret = pParser->SetValueByIndex(49, "156");//货币代码
+    if(ret < 0)
+        return false;
+	ret = pParser->SetValueByIndex(53, "2600000000000000");//PIN block的补充信息
+    if(ret < 0)
+        return false;
+	{
+		ss.str("");
+		//processing code(n2)
+		ss<<"68";
+		//Amount type(n2)
+		ss<<"95";
+		//currency code of amount(n3)
+		ss<<"156";
+		//‘D’ - for debit amount of ‘C’ for credit amount
+		ss<<"D";
+		//Amount(n12)
+		ss<<setw(12)<<setfill('0')<<0;
+		
+		ret = pParser->SetValueByIndex(54, ss.str());//金额及相关帐户数据信息
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(55, ecloaddtl.field55, sizeof(ecloaddtl.field55));//IC卡交易使用数据
+	if(ret < 0)
+		return false;
+	
+	{
+		ss.str("");
+		//第一子域PD
+		ss<<"PD";
+		ss<<"050";//PD值长度
+			//PD.1(n4)
+			ss<<"0000";
+			//PD.2(n11)
+				//PD.2.1：保留使用
+				ss<<"0";
+				//PD.2.2：保留使用
+				ss<<"0";
+				//PD.2.3：保留使用
+				ss<<"0";
+				//PD.2.4：保留使用
+				ss<<"0";
+				//PD.2.5：终端类型
+				ss<<"01";//ATM
+				//PD.2.6：保留使用
+				ss<<"0";
+				//PD.2.7：保留使用
+				ss<<"0";
+				//PD.2.8：保留使用
+				ss<<"00";
+				//PD.2.9：保留使用
+				ss<<"0";
+			//PD.3(ans15)	
+				//PD.3.1：特殊计费类型
+				ss<<"00";//00 01
+				//PD.3.2：特殊计费档次
+				ss<<"0";//0 1 2
+				//PD.3.3：保留使用
+				ss<<"000";
+				//PD.3.4：保留使用
+				ss<<"0";
+				//PD.3.5：交易发起方式
+				ss<<"0";//0 1 2
+				//PD.3.6：卡介质
+				ss<<"0";
+				//PD.3.7：保留使用
+				ss<<"0";
+				//PD.3.8：保留使用
+				ss<<"00";
+				//PD.3.9：保留使用
+				ss<<"0";
+				//PD.3.10：保留使用
+				ss<<"00";
+				//PD.3.11：保留使用
+				ss<<setw(20)<<setfill('0')<<"0";
+
+		ret = pParser->SetValueByIndex(60, ss.str());//金融IC卡上送的数据
+		if(ret < 0)
+			return false;
+	}
+	ret = pParser->SetValueByIndex(64, "ABCDEF");//mac
+	if(ret < 0)
+		return false;
+	
+	{
+		ss.str("");
+		//信息类型码
+		ss<<"0200";
+		//系统跟踪号
+		ss<<ecloaddtl.refno + 8;
+		//交易日期和时间(b7)
+		ss<<tag_hex2str(string(ecloaddtl.accdate)+string(ecloaddtl.acctime));
+		//原收单机构(n11)
+		value=value.erase(0, value.length());
+		ret = get_ec_para(TERMINAL_IDENTIFICATION, value);
+		if (ret)
+		{
+			LOG(ERROR, "终端编号未配置");
+			return false;
+		}
+		ss<<setw(11)<<setfill('0')<<value;
+		//原交易的发送机构(n11)
+		ss<<setw(11)<<setfill('0')<<"0";
+		
+		ret = pParser->SetValueByIndex(90, ss.str());//原始交易信息*
+		if(ret < 0)
+			return false;
+	}	
+		
+		ret = pParser->SetValueByIndex(128, "ABCDEF");//mac
+		if(ret < 0)
+			return false;
+		
+	BufferType msg;
+    size_t msglen = 0;
+    size_t pack8583len = 0;
+   
+    pParser->PackData(msg.begin() + msglen, &pack8583len, NULL);
+    msglen += pack8583len;
+    LOG(DEBUG, "\n" << msg.data());
+    body=body.erase(0, body.length());
+	body.append(msg.data());
+    LOG(DEBUG, "msglen:" << msglen);
+    LOG(DEBUG, "data:" << body);
+    return true;
+}
+
+int ec_bank_cash_boc::post_transfer(T_t_ecloaddtl& ecloaddtl, const ec_bank_trans_param& para, int write_card)
+{
+
+    return r_ok;
+}
+
+int ec_bank_cash_boc::send_to_boc(T_t_ecloaddtl& ecloaddtl, const std::string& req, std::string& resp)
+{
+    int timeout = 10000;
+    string boc_ip;
+    int boc_port;
+    int ret;
+
+    ret = get_ec_para(BOCEC_SVRIP, boc_ip);
+    if (ret)
+    {
+        LOG(ERROR, "中行前置机未配置");
+        return r_conn;
+    }
+    ret = get_ec_para(BOCEC_SVRPORT, boc_port);
+    if (ret)
+    {
+        LOG(ERROR, "中行前置机未配置");
+        return r_conn;
+    }
+    LOG(DEBUG, "中行服务器[" << boc_ip << ":" << boc_port << "]");
+
+    CTcpSocket sock;
+    alarm(timeout / 1000);
+    if (!sock.ConnectTcp((char*)boc_ip.c_str(), boc_port))
+    {
+        alarm(0);
+        strcpy(ecloaddtl.errmsg, "连接中行服务器失败");
+        LOG(ERROR, "connect to boc error");
+        return r_conn;
+    }
+    alarm(0);
+
+    // 中行报文
+    stringstream ss;
+	string tmp_str;
+    ss << hex <<setw(8) << setfill('0')<< req.length();
+	tmp_str=tag_hex2str(ss.str());
+	ss.str("");
+	ss << tmp_str <<req;
+
+    LOG(DEBUG, "中行报文[" << ss.str() << "]");
+    if (sock.Send((char*)ss.str().c_str(), ss.str().length()) < (int)ss.str().length())
+    {
+        strcpy(ecloaddtl.errmsg, "发送数据到中行服务器失败");
+        LOG(ERROR, "Send to boc error");
+        return r_send;
+    }
+    // 包头
+    size_t body_len = 0;
+    {
+        char buffer[5] = {0};
+        if (sock.Recv(buffer, 4, timeout) <= 0)
+        {
+            strcpy(ecloaddtl.errmsg, "接收中行返回数据头失败");
+            LOG(ERROR, ecloaddtl.errmsg);
+            return r_recv;
+        }
+        
+        body_len=buffer[3]+buffer[2]*256+buffer[1]*256*256+buffer[0]*256*256*256;
+    }
+    // 包体
+    string body;
+    {
+        char* buffer = new char[body_len + 1];
+        memset(buffer, 0, body_len + 1);
+        if (sock.Recv(buffer, body_len, timeout) <= 0)
+        {
+            strcpy(ecloaddtl.errmsg, "接收中行返回数据内容失败");
+            LOG(ERROR, ecloaddtl.errmsg);
+            delete [] buffer;
+            return r_recv;
+        }
+        body = buffer;
+        delete [] buffer;
+
+        resp = body;
+    }
+    return r_ok;
+}
+int ec_bank_cash_boc::reverse_to_boc(T_t_ecloaddtl& ecloaddtl, const std::string& req, std::string& resp)
+{
+    int ret;
+	LOG(DEBUG, "发起冲正");
+	ret=send_to_boc(ecloaddtl,req,resp);
+	if (ret)
+		return r_error;
+    return r_ok;
+}

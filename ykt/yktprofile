@@ -1,0 +1,30 @@
+OS_VER=`uname`
+export PATH=$PATH:$ORACLE_HOME/bin
+if [ "$OS_VER" = "SunOS" ] || [ "$OS_VER" = "AIX" ]; then
+	LD_LIBRARY_PATH=/usr/lib:/usr/local/lib:$ORACLE_HOME/lib32:$ORACLE_HOME/rdbms/lib32
+else
+	LD_LIBRARY_PATH=/usr/lib:/usr/local/lib:$ORACLE_HOME/lib:$ORACLE_HOME/rdbms/lib
+fi
+export LD_LIBRARY_PATH
+export NLS_LANG=american_america.ZHS16GBK
+
+export LANG=zh_CN.gbk
+export LANGUAGE=zh_CN.GBK
+
+alias cdi="cd $HOME/ykt/src/include"
+alias cdp="cd $HOME/ykt/src/public"
+alias cddb="cd $HOME/ykt/src/db"
+alias cds="cd $HOME/ykt/src"
+alias cdf="cd $HOME/ykt/src/func"
+alias cdlog="cd $HOME/ykt/log"
+alias cdb="cd $HOME/ykt/bin"
+alias cdl="cd $HOME/ykt/lib"
+alias cdsbin="cd $HOME/ykt/sbin"
+alias cdbak="cd $HOME/db_bak"
+alias cdt="cd $HOME/ykt/src/test"
+alias cdtest="cd $HOME/test"
+alias cdpos="cd $HOME/ykt/src/upayposvr"
+
+export BIN_PATH=$HOME/ykt/bin
+export PATH=$PATH:$HOME/ykt/sbin:$BIN_PATH:$BIN_PATH/icelib:.
+
